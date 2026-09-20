@@ -16,6 +16,11 @@ import { logForDebugging } from '../../utils/debug.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { escapeRegExp } from '../../utils/stringUtils.js'
 import { isToolSearchEnabledOptimistic } from '../../utils/toolSearch.js'
+import { getExecutionProviderProfile, resolveProviderModel } from '../../providers/runtime.js'
+import {
+  formatLocalToolSearchResult,
+  searchToolCatalog,
+} from '../../services/toolCatalog/discovery.js'
 import { getPrompt, isDeferredTool, TOOL_SEARCH_TOOL_NAME } from './prompt.js'
 
 export const inputSchema = lazySchema(() =>
@@ -40,6 +45,7 @@ export const outputSchema = lazySchema(() =>
     query: z.string(),
     total_deferred_tools: z.number(),
     pending_mcp_servers: z.array(z.string()).optional(),
+    discovery: z.literal('local').optional(),
   }),
 )
 type OutputSchema = ReturnType<typeof outputSchema>
@@ -314,10 +320,10 @@ export const ToolSearchTool = buildTool({
   name: TOOL_SEARCH_TOOL_NAME,
   maxResultSizeChars: 100_000,
   async description() {
-    return getPrompt()
+    return getPrompt(Boolean(getExecutionProviderProfile()))
   },
   async prompt() {
-    return getPrompt()
+    return getPrompt(Boolean(getExecutionProviderProfile()))
   },
   get inputSchema(): InputSchema {
     return inputSchema()
@@ -325,10 +331,41 @@ export const ToolSearchTool = buildTool({
   get outputSchema(): OutputSchema {
     return outputSchema()
   },
-  async call(input, { options: { tools }, getAppState }) {
+  async call(input, context) {
+    const { options: { tools }, getAppState } = context
     const { query, max_results = 5 } = input
 
     const deferredTools = tools.filter(isDeferredTool)
+
+    if (resolveProviderModel(context.options.mainLoopModel)) {
+      const signal = context.abortController.signal
+      signal.throwIfAborted()
+      // The registry and permissions belong to this agent. Do not share the
+      // legacy name-only description cache across agents or MCP connections.
+      const entries = await Promise.all(tools.map(async tool => ({
+        name: tool.name,
+        aliases: tool.aliases,
+        deferred: isDeferredTool(tool),
+        searchHint: tool.searchHint,
+        description: isDeferredTool(tool) ? await tool.prompt({
+          getToolPermissionContext: async () => getAppState().toolPermissionContext,
+          tools,
+          agents: context.options.agentDefinitions.activeAgents,
+        }) : '',
+      })))
+      signal.throwIfAborted()
+      const matches = searchToolCatalog(entries, query, max_results)
+      const pendingServers = matches.length === 0
+        ? getAppState().mcp.clients.filter(client => client.type === 'pending').map(client => client.name)
+        : []
+      return {
+        data: {
+          ...buildSearchResult(matches, query, deferredTools.length, pendingServers).data,
+          discovery: 'local' as const,
+        },
+      }
+    }
+
     maybeInvalidateCache(deferredTools)
 
     // Check for MCP servers still connecting
@@ -437,14 +474,20 @@ export const ToolSearchTool = buildTool({
   },
   userFacingName: () => '',
   /**
-   * Returns a tool_result with tool_reference blocks.
-   * This format works on 1P/Foundry. Bedrock/Vertex may not support
-   * client-side tool_reference expansion yet.
+   * Configured profiles return portable text for client-side discovery. Legacy
+   * providers retain tool_reference blocks for vendor-side expansion.
    */
   mapToolResultToToolResultBlockParam(
     content: Output,
     toolUseID: string,
   ): ToolResultBlockParam {
+    if (content.discovery === 'local') {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUseID,
+        content: formatLocalToolSearchResult(content.matches, content.pending_mcp_servers),
+      }
+    }
     if (content.matches.length === 0) {
       let text = 'No matching deferred tools found'
       if (

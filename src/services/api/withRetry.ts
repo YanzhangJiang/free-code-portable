@@ -1,5 +1,4 @@
 import { feature } from 'bun:bundle'
-import type Anthropic from '@anthropic-ai/sdk'
 import {
   APIConnectionError,
   APIError,
@@ -9,9 +8,8 @@ import type { QuerySource } from 'src/constants/querySource.js'
 import type { SystemAPIErrorMessage } from 'src/types/message.js'
 import { isAwsCredentialsProviderError } from 'src/utils/aws.js'
 import { logForDebugging } from 'src/utils/debug.js'
-import { logError } from 'src/utils/log.js'
 import { createSystemAPIErrorMessage } from 'src/utils/messages.js'
-import { getAPIProviderForStatsig } from 'src/utils/model/providers.js'
+import { getAPIProvider, getAPIProviderForStatsig } from 'src/utils/model/providers.js'
 import {
   clearApiKeyHelperCache,
   clearAwsCredentialsCache,
@@ -35,6 +33,12 @@ import { isNonCustomOpusModel } from '../../utils/model/model.js'
 import { disableKeepAlive } from '../../utils/proxy.js'
 import { sleep } from '../../utils/sleep.js'
 import type { ThinkingConfig } from '../../utils/thinking.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
+import {
+  classifyProviderError,
+  getProviderOutputTokenRetry,
+  redactProviderErrorMessage,
+} from '../../providers/errors.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../analytics/growthbook.js'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -50,7 +54,6 @@ import { extractConnectionErrorDetails } from './errorUtils.js'
 const abortError = () => new APIUserAbortError()
 
 const DEFAULT_MAX_RETRIES = 10
-const FLOOR_OUTPUT_TOKENS = 3000
 const MAX_529_RETRIES = 3
 export const BASE_DELAY_MS = 500
 
@@ -129,6 +132,8 @@ interface RetryOptions {
   model: string
   fallbackModel?: string
   thinkingConfig: ThinkingConfig
+  /** Actual output limit of the first request, before any recovery adjustment. */
+  maxOutputTokens?: number
   fastMode?: boolean
   signal?: AbortSignal
   querySource?: QuerySource
@@ -146,13 +151,13 @@ export class CannotRetryError extends Error {
     public readonly originalError: unknown,
     public readonly retryContext: RetryContext,
   ) {
-    const message = errorMessage(originalError)
+    const message = redactProviderErrorMessage(errorMessage(originalError))
     super(message)
     this.name = 'RetryError'
 
     // Preserve the original stack trace if available
     if (originalError instanceof Error && originalError.stack) {
-      this.stack = originalError.stack
+      this.stack = redactProviderErrorMessage(originalError.stack)
     }
   }
 }
@@ -167,22 +172,26 @@ export class FallbackTriggeredError extends Error {
   }
 }
 
-export async function* withRetry<T>(
-  getClient: () => Promise<Anthropic>,
+export async function* withRetry<T, Client>(
+  getClient: () => Promise<Client>,
   operation: (
-    client: Anthropic,
+    client: Client,
     attempt: number,
     context: RetryContext,
   ) => Promise<T>,
   options: RetryOptions,
 ): AsyncGenerator<SystemAPIErrorMessage, T> {
   const maxRetries = getMaxRetries(options)
+  // Pin authentication policy to this request, never to a later UI selection.
+  const requestProfile = resolveProviderModel(options.model)?.profile
+  const usesLegacyAuth = !requestProfile
+  const usesLegacyAnthropicAuth = usesLegacyAuth && getAPIProvider(options.model) === 'firstParty'
   const retryContext: RetryContext = {
     model: options.model,
     thinkingConfig: options.thinkingConfig,
     ...(isFastModeEnabled() && { fastMode: options.fastMode }),
   }
-  let client: Anthropic | null = null
+  let client: Client | null = null
   let consecutive529Errors = options.initialConsecutive529Errors ?? 0
   let lastError: unknown
   let persistentAttempt = 0
@@ -239,8 +248,9 @@ export async function* withRetry<T>(
       ) {
         // On 401 "token expired" or 403 "token revoked", force a token refresh
         if (
-          (lastError instanceof APIError && lastError.status === 401) ||
-          isOAuthTokenRevokedError(lastError)
+          usesLegacyAnthropicAuth &&
+          ((lastError instanceof APIError && lastError.status === 401) ||
+            isOAuthTokenRevokedError(lastError))
         ) {
           const failedAccessToken = getClaudeAIOAuthTokens()?.accessToken
           if (failedAccessToken) {
@@ -252,9 +262,12 @@ export async function* withRetry<T>(
 
       return await operation(client, attempt, retryContext)
     } catch (error) {
+      if (options.signal?.aborted || error instanceof APIUserAbortError) throw new APIUserAbortError()
+      const failure = classifyProviderError(error)
+      if (failure.kind === 'cancelled') throw new APIUserAbortError()
       lastError = error
       logForDebugging(
-        `API error (attempt ${attempt}/${maxRetries + 1}): ${error instanceof APIError ? `${error.status} ${error.message}` : errorMessage(error)}`,
+        `API error (attempt ${attempt}/${maxRetries + 1}): ${failure.status ?? ''} ${failure.message}`,
         { level: 'error' },
       )
 
@@ -371,59 +384,43 @@ export async function* withRetry<T>(
         throw new CannotRetryError(error, retryContext)
       }
 
-      // AWS/GCP errors aren't always APIError, but can be retried
-      const handledCloudAuthError =
-        handleAwsCredentialError(error) || handleGcpCredentialError(error)
-      if (
-        !handledCloudAuthError &&
-        (!(error instanceof APIError) || !shouldRetry(error))
-      ) {
+      // Retry only when the response gives enough information for a strictly
+      // smaller valid request. Otherwise let reactive compaction reduce input.
+      const adjustedMaxTokens = getProviderOutputTokenRetry(failure, {
+        requestedMaxTokens: retryContext.maxTokensOverride ?? failure.context?.outputTokens ?? options.maxOutputTokens,
+        thinkingBudgetTokens: retryContext.thinkingConfig.type === 'enabled'
+          ? retryContext.thinkingConfig.budgetTokens
+          : undefined,
+      })
+      if (adjustedMaxTokens !== undefined) {
+        retryContext.maxTokensOverride = adjustedMaxTokens
+        logEvent('tengu_max_tokens_context_overflow_adjustment', {
+          inputTokens: failure.context?.inputTokens,
+          contextLimit: failure.context?.limitTokens,
+          adjustedMaxTokens,
+          attempt,
+        })
+        continue
+      }
+      if (failure.kind === 'context_overflow' || failure.kind === 'output_limit' ||
+          failure.kind === 'unsupported' || failure.kind === 'quota_exceeded') {
         throw new CannotRetryError(error, retryContext)
       }
 
-      // Handle max tokens context overflow errors by adjusting max_tokens for the next attempt
-      // NOTE: With extended-context-window beta, this 400 error should not occur.
-      // The API now returns 'model_context_window_exceeded' stop_reason instead.
-      // Keeping for backward compatibility.
-      if (error instanceof APIError) {
-        const overflowData = parseMaxTokensContextOverflowError(error)
-        if (overflowData) {
-          const { inputTokens, contextLimit } = overflowData
+      // Static provider credentials cannot be repaired by refreshing a Claude
+      // account. Cloud profile auth is handled by its own SDK refresh mechanism.
+      if (requestProfile && (failure.kind === 'authentication' || failure.kind === 'permission')) {
+        throw new CannotRetryError(error, retryContext)
+      }
 
-          const safetyBuffer = 1000
-          const availableContext = Math.max(
-            0,
-            contextLimit - inputTokens - safetyBuffer,
-          )
-          if (availableContext < FLOOR_OUTPUT_TOKENS) {
-            logError(
-              new Error(
-                `availableContext ${availableContext} is less than FLOOR_OUTPUT_TOKENS ${FLOOR_OUTPUT_TOKENS}`,
-              ),
-            )
-            throw error
-          }
-          // Ensure we have enough tokens for thinking + at least 1 output token
-          const minRequired =
-            (retryContext.thinkingConfig.type === 'enabled'
-              ? retryContext.thinkingConfig.budgetTokens
-              : 0) + 1
-          const adjustedMaxTokens = Math.max(
-            FLOOR_OUTPUT_TOKENS,
-            availableContext,
-            minRequired,
-          )
-          retryContext.maxTokensOverride = adjustedMaxTokens
-
-          logEvent('tengu_max_tokens_context_overflow_adjustment', {
-            inputTokens,
-            contextLimit,
-            adjustedMaxTokens,
-            attempt,
-          })
-
-          continue
-        }
+      // AWS/GCP errors aren't always APIError, but can be retried
+      const handledCloudAuthError =
+        usesLegacyAuth && (handleAwsCredentialError(error) || handleGcpCredentialError(error))
+      if (
+        !handledCloudAuthError &&
+        !(error instanceof APIError ? shouldRetry(error, usesLegacyAnthropicAuth) : failure.retryable)
+      ) {
+        throw new CannotRetryError(error, retryContext)
       }
 
       // For other errors, proceed with normal retry logic
@@ -547,51 +544,13 @@ export function getRetryDelay(
   return baseDelay + jitter
 }
 
-export function parseMaxTokensContextOverflowError(error: APIError):
-  | {
-      inputTokens: number
-      maxTokens: number
-      contextLimit: number
-    }
+export function parseMaxTokensContextOverflowError(error: unknown):
+  | { inputTokens: number; maxTokens: number; contextLimit: number }
   | undefined {
-  if (error.status !== 400 || !error.message) {
-    return undefined
-  }
-
-  if (
-    !error.message.includes(
-      'input length and `max_tokens` exceed context limit',
-    )
-  ) {
-    return undefined
-  }
-
-  // Example format: "input length and `max_tokens` exceed context limit: 188059 + 20000 > 200000"
-  const regex =
-    /input length and `max_tokens` exceed context limit: (\d+) \+ (\d+) > (\d+)/
-  const match = error.message.match(regex)
-
-  if (!match || match.length !== 4) {
-    return undefined
-  }
-
-  if (!match[1] || !match[2] || !match[3]) {
-    logError(
-      new Error(
-        'Unable to parse max_tokens from max_tokens exceed context limit error message',
-      ),
-    )
-    return undefined
-  }
-  const inputTokens = parseInt(match[1], 10)
-  const maxTokens = parseInt(match[2], 10)
-  const contextLimit = parseInt(match[3], 10)
-
-  if (isNaN(inputTokens) || isNaN(maxTokens) || isNaN(contextLimit)) {
-    return undefined
-  }
-
-  return { inputTokens, maxTokens, contextLimit }
+  const { context, kind } = classifyProviderError(error)
+  if (kind !== 'context_overflow' || context?.inputTokens === undefined ||
+      context.outputTokens === undefined || context.limitTokens === undefined) return undefined
+  return { inputTokens: context.inputTokens, maxTokens: context.outputTokens, contextLimit: context.limitTokens }
 }
 
 // TODO: Replace with a response header check once the API adds a dedicated
@@ -693,7 +652,8 @@ function handleGcpCredentialError(error: unknown): boolean {
   return false
 }
 
-function shouldRetry(error: APIError): boolean {
+function shouldRetry(error: APIError, usesLegacyAnthropicAuth: boolean): boolean {
+  if (!usesLegacyAnthropicAuth && (error.status === 401 || error.status === 403)) return false
   // Never retry mock errors - they're from /mock-limits command for testing
   if (isMockRateLimitError(error)) {
     return false
@@ -710,7 +670,7 @@ function shouldRetry(error: APIError): boolean {
   // credentials. Bypass x-should-retry:false — the server assumes we'd retry
   // the same bad key, but our key is fine.
   if (
-    isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) &&
+    usesLegacyAnthropicAuth && isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) &&
     (error.status === 401 || error.status === 403)
   ) {
     return true
@@ -771,12 +731,13 @@ function shouldRetry(error: APIError): boolean {
   // Clear API key cache on 401 and allow retry.
   // OAuth token handling is done in the main retry loop via handleOAuth401Error.
   if (error.status === 401) {
+    if (!usesLegacyAnthropicAuth) return false
     clearApiKeyHelperCache()
     return true
   }
 
   // Retry on 403 "token revoked" (same refresh logic as 401, see above)
-  if (isOAuthTokenRevokedError(error)) {
+  if (usesLegacyAnthropicAuth && isOAuthTokenRevokedError(error)) {
     return true
   }
 

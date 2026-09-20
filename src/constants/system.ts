@@ -5,6 +5,8 @@ import { logForDebugging } from '../utils/debug.js'
 import { isEnvDefinedFalsy } from '../utils/envUtils.js'
 import { getAPIProvider } from '../utils/model/providers.js'
 import { getWorkload } from '../utils/workloadContext.js'
+import { resolveProviderModel } from '../providers/runtime.js'
+import { PROVIDER_AGENT_IDENTITY } from '../providers/prompt-policy.js'
 
 const DEFAULT_PREFIX = `You are Claude Code, Anthropic's official CLI for Claude.`
 const AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX = `You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.`
@@ -14,6 +16,7 @@ const CLI_SYSPROMPT_PREFIX_VALUES = [
   DEFAULT_PREFIX,
   AGENT_SDK_CLAUDE_CODE_PRESET_PREFIX,
   AGENT_SDK_PREFIX,
+  PROVIDER_AGENT_IDENTITY,
 ] as const
 
 export type CLISyspromptPrefix = (typeof CLI_SYSPROMPT_PREFIX_VALUES)[number]
@@ -29,8 +32,10 @@ export const CLI_SYSPROMPT_PREFIXES: ReadonlySet<string> = new Set(
 export function getCLISyspromptPrefix(options?: {
   isNonInteractive: boolean
   hasAppendSystemPrompt: boolean
+  model?: string
 }): CLISyspromptPrefix {
-  const apiProvider = getAPIProvider()
+  if (resolveProviderModel(options?.model)) return PROVIDER_AGENT_IDENTITY
+  const apiProvider = getAPIProvider(options?.model)
   if (apiProvider === 'vertex') {
     return DEFAULT_PREFIX
   }
@@ -65,7 +70,10 @@ function isAttributionHeaderEnabled(): boolean {
  * wrapper in client.ts handles the replacement. The server verifies
  * this token to gate features like fast mode.
  */
-export function getAttributionHeader(fingerprint: string): string {
+export function getAttributionHeader(fingerprint: string, model?: string): string {
+  // This server-side billing/feature attestation belongs to Anthropic's legacy
+  // product protocol. It is not part of a configured provider's system prompt.
+  if (resolveProviderModel(model)) return ''
   if (!isAttributionHeaderEnabled()) {
     return ''
   }

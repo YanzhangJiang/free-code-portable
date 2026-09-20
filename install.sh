@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# free-code installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/paoloanzn/free-code/main/install.sh | bash
+# Free Code Portable installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/YanzhangJiang/free-code-portable/main/install.sh | bash
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,8 +12,8 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RESET='\033[0m'
 
-REPO="https://github.com/paoloanzn/free-code.git"
-INSTALL_DIR="$HOME/free-code"
+REPO="https://github.com/YanzhangJiang/free-code-portable.git"
+INSTALL_DIR="$HOME/free-code-portable"
 BUN_MIN_VERSION="1.3.11"
 
 info()  { printf "${CYAN}[*]${RESET} %s\n" "$*"; }
@@ -23,18 +23,25 @@ fail()  { printf "${RED}[x]${RESET} %s\n" "$*"; exit 1; }
 
 header() {
   echo ""
-  printf "${BOLD}${CYAN}"
-  cat << 'ART'
-   ___                            _
-  / _|_ __ ___  ___        ___ __| | ___
- | |_| '__/ _ \/ _ \_____ / __/ _` |/ _ \
- |  _| | |  __/  __/_____| (_| (_| |  __/
- |_| |_|  \___|\___|      \___\__,_|\___|
-
-ART
-  printf "${RESET}"
-  printf "${DIM}  The free build of Claude Code${RESET}\n"
+  printf "${BOLD}${CYAN}  Free Code Portable${RESET}\n"
+  printf "${DIM}  A multi-provider coding agent, forked from free-code${RESET}\n"
   echo ""
+}
+
+usage() {
+  cat <<EOF
+Usage: bash install.sh [--help]
+
+Build and install Free Code Portable on macOS or Linux.
+Requires git; installs or upgrades Bun if needed.
+
+Source: $REPO
+Checkout: $INSTALL_DIR
+Command: $HOME/.local/bin/free-code-portable
+Build: bun run build (standard feature set)
+
+The existing free-code installation is not replaced.
+EOF
 }
 
 # -------------------------------------------------------------------
@@ -97,14 +104,22 @@ install_bun() {
 # -------------------------------------------------------------------
 
 clone_repo() {
-  if [ -d "$INSTALL_DIR" ]; then
+  if [ -e "$INSTALL_DIR" ] || [ -L "$INSTALL_DIR" ]; then
     warn "$INSTALL_DIR already exists"
-    if [ -d "$INSTALL_DIR/.git" ]; then
-      info "Pulling latest changes..."
-      git -C "$INSTALL_DIR" pull --ff-only origin main 2>/dev/null || {
-        warn "Pull failed, continuing with existing copy"
-      }
-    fi
+    [ -d "$INSTALL_DIR/.git" ] || [ -f "$INSTALL_DIR/.git" ] ||
+      fail "Existing install directory is not a Git checkout: $INSTALL_DIR"
+    local origin
+    origin="$(git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null)" ||
+      fail "Existing checkout has no origin remote: $INSTALL_DIR"
+    case "$origin" in
+      "$REPO"|"${REPO%.git}"|git@github.com:YanzhangJiang/free-code-portable.git|ssh://git@github.com/YanzhangJiang/free-code-portable.git) ;;
+      *) fail "Existing checkout origin is '$origin', expected '$REPO'. Refusing to update a different repository." ;;
+    esac
+    [ "$(git -C "$INSTALL_DIR" branch --show-current)" = "main" ] ||
+      fail "Existing checkout is not on main. Switch branches yourself before running the installer."
+    info "Pulling latest changes..."
+    git -C "$INSTALL_DIR" pull --ff-only origin main ||
+      fail "Update failed. Resolve the existing checkout before running the installer again."
   else
     info "Cloning repository..."
     git clone --depth 1 "$REPO" "$INSTALL_DIR"
@@ -115,23 +130,28 @@ clone_repo() {
 install_deps() {
   info "Installing dependencies..."
   cd "$INSTALL_DIR"
-  bun install --frozen-lockfile 2>/dev/null || bun install
+  bun install --frozen-lockfile
   ok "Dependencies installed"
 }
 
 build_binary() {
-  info "Building free-code (all experimental features enabled)..."
+  info "Building Free Code Portable (standard feature set)..."
   cd "$INSTALL_DIR"
-  bun run build:dev:full
-  ok "Binary built: $INSTALL_DIR/cli-dev"
+  bun run build
+  ok "Binary built: $INSTALL_DIR/cli"
 }
 
 link_binary() {
   local link_dir="$HOME/.local/bin"
   mkdir -p "$link_dir"
 
-  ln -sf "$INSTALL_DIR/cli-dev" "$link_dir/free-code"
-  ok "Symlinked: $link_dir/free-code"
+  local link_path="$link_dir/free-code-portable"
+  if [ -e "$link_path" ] || [ -L "$link_path" ]; then
+    [ -L "$link_path" ] && [ "$(readlink "$link_path")" = "$INSTALL_DIR/cli" ] ||
+      fail "Refusing to replace an existing command at $link_path. Move it yourself before installing."
+  fi
+  ln -sf "$INSTALL_DIR/cli" "$link_path"
+  ok "Symlinked: $link_path"
 
   if ! echo "$PATH" | tr ':' '\n' | grep -qx "$link_dir"; then
     warn "$link_dir is not on your PATH"
@@ -146,34 +166,48 @@ link_binary() {
 # Main
 # -------------------------------------------------------------------
 
-header
-info "Starting installation..."
-echo ""
+main() {
+  [ "$#" -le 1 ] || fail "Unexpected arguments: $*"
+  case "${1:-}" in
+    --help|-h) usage; return 0 ;;
+    "") ;;
+    *) usage >&2; fail "Unknown argument: $1" ;;
+  esac
 
-check_os
-check_git
-check_bun
-echo ""
+  header
+  info "Starting installation..."
+  echo ""
 
-clone_repo
-install_deps
-build_binary
-link_binary
+  check_os
+  check_git
+  check_bun
+  echo ""
 
-echo ""
-printf "${GREEN}${BOLD}  Installation complete!${RESET}\n"
-echo ""
-printf "  ${BOLD}Run it:${RESET}\n"
-printf "    ${CYAN}free-code${RESET}                          # interactive REPL\n"
-printf "    ${CYAN}free-code -p \"your prompt\"${RESET}          # one-shot mode\n"
-echo ""
-printf "  ${BOLD}Set your API key:${RESET}\n"
-printf "    ${CYAN}export ANTHROPIC_API_KEY=\"sk-ant-...\"${RESET}\n"
-echo ""
-printf "  ${BOLD}Or log in with Claude.ai:${RESET}\n"
-printf "    ${CYAN}free-code /login${RESET}\n"
-echo ""
-printf "  ${DIM}Source: $INSTALL_DIR${RESET}\n"
-printf "  ${DIM}Binary: $INSTALL_DIR/cli-dev${RESET}\n"
-printf "  ${DIM}Link:   ~/.local/bin/free-code${RESET}\n"
-echo ""
+  clone_repo
+  install_deps
+  build_binary
+  link_binary
+
+  echo ""
+  printf "${GREEN}${BOLD}  Installation complete!${RESET}\n"
+  echo ""
+  printf "  ${BOLD}Run it:${RESET}\n"
+  printf "    ${CYAN}free-code-portable${RESET}                       # interactive REPL\n"
+  printf "    ${CYAN}free-code-portable -p \"your prompt\"${RESET}     # one-shot mode\n"
+  echo ""
+  printf "  ${BOLD}Configure your providers and services:${RESET}\n"
+  printf "    %s\n" "$INSTALL_DIR/PROVIDERS.md" "$INSTALL_DIR/EXTERNAL_SERVICES.md"
+  printf "    ${CYAN}free-code-portable --providers-file /path/to/providers.json --provider <profile>${RESET}\n"
+  echo ""
+  printf "  ${BOLD}For an Anthropic API key:${RESET}\n"
+  printf "    ${CYAN}export ANTHROPIC_API_KEY=\"sk-ant-...\"${RESET}\n"
+  echo ""
+  printf "  ${DIM}Source: $INSTALL_DIR${RESET}\n"
+  printf "  ${DIM}Binary: $INSTALL_DIR/cli${RESET}\n"
+  printf "  ${DIM}Link:   ~/.local/bin/free-code-portable${RESET}\n"
+  echo ""
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

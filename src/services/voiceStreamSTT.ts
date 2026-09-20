@@ -1,13 +1,8 @@
-// Anthropic voice_stream speech-to-text client for push-to-talk.
+// Speech-to-text transport selection for push-to-talk. A configured standalone
+// service receives a completed WAV upload; otherwise preserve the legacy
+// Anthropic voice_stream WebSocket with its own OAuth credentials.
 //
-// Only reachable in ant builds (gated by feature('VOICE_MODE') in useVoice.ts import).
-//
-// Connects to Anthropic's voice_stream WebSocket endpoint using the same
-// OAuth credentials as Claude Code.  The endpoint uses conversation_engine
-// backed models for speech-to-text.  Designed for hold-to-talk: hold the
-// keybinding to record, release to stop and submit.
-//
-// The wire protocol uses JSON control messages (KeepAlive, CloseStream) and
+// The legacy wire protocol uses JSON control messages (KeepAlive, CloseStream) and
 // binary audio frames.  The server responds with TranscriptText and
 // TranscriptEndpoint JSON messages.
 
@@ -25,6 +20,11 @@ import { logError } from '../utils/log.js'
 import { getWebSocketTLSOptions } from '../utils/mtls.js'
 import { getWebSocketProxyAgent, getWebSocketProxyUrl } from '../utils/proxy.js'
 import { jsonParse, jsonStringify } from '../utils/slowOperations.js'
+import { getExternalServices, resolveExternalServiceCredentials } from './external/runtime.js'
+import { createTranscriptionConnection } from './voice/transcription.js'
+import { getProxyFetchOptions } from '../utils/proxy.js'
+import type { FinalizeSource, VoiceStreamCallbacks, VoiceStreamConnection } from './voice/connection.js'
+export type { FinalizeSource, VoiceStreamCallbacks, VoiceStreamConnection } from './voice/connection.js'
 
 const KEEPALIVE_MSG = '{"type":"KeepAlive"}'
 const CLOSE_STREAM_MSG = '{"type":"CloseStream"}'
@@ -47,29 +47,6 @@ export const FINALIZE_TIMEOUTS_MS = {
 }
 
 // ─── Types ──────────────────────────────────────────────────────────
-
-export type VoiceStreamCallbacks = {
-  onTranscript: (text: string, isFinal: boolean) => void
-  onError: (error: string, opts?: { fatal?: boolean }) => void
-  onClose: () => void
-  onReady: (connection: VoiceStreamConnection) => void
-}
-
-// How finalize() resolved. `no_data_timeout` means zero server messages
-// after CloseStream — the silent-drop signature (anthropics/anthropic#287008).
-export type FinalizeSource =
-  | 'post_closestream_endpoint'
-  | 'no_data_timeout'
-  | 'safety_timeout'
-  | 'ws_close'
-  | 'ws_already_closed'
-
-export type VoiceStreamConnection = {
-  send: (audioChunk: Buffer) => void
-  finalize: () => Promise<FinalizeSource>
-  close: () => void
-  isConnected: () => boolean
-}
 
 // The voice_stream endpoint returns transcript chunks and endpoint markers.
 type VoiceStreamTranscriptText = {
@@ -96,6 +73,7 @@ type VoiceStreamMessage =
 // ─── Availability ──────────────────────────────────────────────────────
 
 export function isVoiceStreamAvailable(): boolean {
+  if (getExternalServices().configuration.voice) return true
   // voice_stream uses the same OAuth as Claude Code — available when the
   // user is authenticated with Anthropic (Claude.ai subscriber or has
   // valid OAuth tokens).
@@ -110,10 +88,26 @@ export function isVoiceStreamAvailable(): boolean {
 
 export async function connectVoiceStream(
   callbacks: VoiceStreamCallbacks,
-  options?: { language?: string; keyterms?: string[] },
+  options?: { language?: string; keyterms?: string[]; signal?: AbortSignal },
 ): Promise<VoiceStreamConnection | null> {
+  if (options?.signal?.aborted) return null
+  const configuredVoice = getExternalServices().configuration.voice
+  if (configuredVoice) {
+    const transport: typeof fetch = Object.assign(
+      (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+        fetch(input, { ...getProxyFetchOptions(), ...init }),
+      { preconnect: fetch.preconnect },
+    )
+    return createTranscriptionConnection(callbacks, {
+      configuration: configuredVoice,
+      credentials: resolveExternalServiceCredentials(configuredVoice),
+      fetch: transport,
+      ...options,
+    })
+  }
   // Ensure OAuth token is fresh before connecting
   await checkAndRefreshOAuthTokenIfNeeded()
+  if (options?.signal?.aborted) return null
 
   const tokens = getClaudeAIOAuthTokens()
   if (!tokens?.accessToken) {
@@ -209,6 +203,9 @@ export async function connectVoiceStream(
   // (~300ms); no-data timer (1.5s); WS close (~3-5s); safety timer (5s).
   let resolveFinalize: ((source: FinalizeSource) => void) | null = null
   let cancelNoDataTimer: (() => void) | null = null
+  let closeStreamTimer: ReturnType<typeof setTimeout> | null = null
+  let explicitlyClosed = false
+  const abortConnection = () => connection.close()
 
   // Define the connection object before event handlers so it can be passed
   // to onReady when the WebSocket opens.
@@ -294,7 +291,8 @@ export async function connectVoiceStream(
         // Without this, stopRecording() can return synchronously while the
         // native module still has a pending onData callback in the event queue,
         // causing audio to arrive after CloseStream.
-        setTimeout(() => {
+        closeStreamTimer = setTimeout(() => {
+          closeStreamTimer = null
           finalized = true
           if (ws.readyState === WebSocket.OPEN) {
             logForDebugging('[voice_stream] Sending CloseStream (finalize)')
@@ -304,15 +302,21 @@ export async function connectVoiceStream(
       })
     },
     close(): void {
+      if (explicitlyClosed) return
+      explicitlyClosed = true
       finalized = true
+      finalizing = true
+      lastTranscriptText = ''
+      resolveFinalize?.('ws_already_closed')
+      if (closeStreamTimer !== null) clearTimeout(closeStreamTimer)
+      closeStreamTimer = null
+      options?.signal?.removeEventListener('abort', abortConnection)
       if (keepaliveTimer) {
         clearInterval(keepaliveTimer)
         keepaliveTimer = null
       }
       connected = false
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close()
-      }
+      if (ws.readyState !== WebSocket.CLOSED) ws.terminate()
     },
     isConnected(): boolean {
       return connected && ws.readyState === WebSocket.OPEN
@@ -320,6 +324,7 @@ export async function connectVoiceStream(
   }
 
   ws.on('open', () => {
+    if (explicitlyClosed) return
     logForDebugging('[voice_stream] WebSocket connected')
     connected = true
 
@@ -355,6 +360,7 @@ export async function connectVoiceStream(
   let lastTranscriptText = ''
 
   ws.on('message', (raw: Buffer | string) => {
+    if (explicitlyClosed) return
     const text = raw.toString()
     logForDebugging(
       `[voice_stream] Message received (${String(text.length)} chars): ${text.slice(0, 200)}`,
@@ -461,6 +467,9 @@ export async function connectVoiceStream(
   })
 
   ws.on('close', (code, reason) => {
+    options?.signal?.removeEventListener('abort', abortConnection)
+    if (closeStreamTimer !== null) clearTimeout(closeStreamTimer)
+    closeStreamTimer = null
     const reasonStr = reason?.toString() ?? ''
     logForDebugging(
       `[voice_stream] WebSocket closed: code=${String(code)} reason="${reasonStr}"`,
@@ -540,5 +549,7 @@ export async function connectVoiceStream(
     }
   })
 
+  options?.signal?.addEventListener('abort', abortConnection, { once: true })
+  if (options?.signal?.aborted) connection.close()
   return connection
 }

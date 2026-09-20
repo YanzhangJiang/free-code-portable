@@ -1,4 +1,6 @@
 import { readFileSync } from 'fs';
+import { getActiveProviderProfile } from '../providers/runtime.js';
+import { call as callLocalUltraplan, prepareLocalUltraplan, LOCAL_ULTRAPLAN_DESCRIPTION } from './localUltraplan.js';
 import { REMOTE_CONTROL_DISCONNECTED_MSG } from '../bridge/types.js';
 import type { Command } from '../commands.js';
 import { DIAMOND_OPEN } from '../constants/figures.js';
@@ -248,6 +250,11 @@ export async function launchUltraplan(opts: {
    */
   onSessionReady?: (msg: string) => void;
 }): Promise<string> {
+  if (getActiveProviderProfile()) {
+    const result = prepareLocalUltraplan(opts);
+    if (result.prompt) enqueuePendingNotification({ value: result.prompt, mode: 'prompt', priority: 'next', isMeta: true, skipSlashCommands: true });
+    return result.message;
+  }
   const {
     blurb,
     seedPlan,
@@ -409,6 +416,7 @@ async function launchDetached(opts: {
   }
 }
 const call: LocalJSXCommandCall = async (onDone, context, args) => {
+  if (getActiveProviderProfile()) return callLocalUltraplan(onDone, context, args);
   const blurb = args.trim();
 
   // Bare /ultraplan (no args, no seed plan) just shows usage — no dialog.
@@ -461,7 +469,7 @@ const call: LocalJSXCommandCall = async (onDone, context, args) => {
 export default {
   type: 'local-jsx',
   name: 'ultraplan',
-  description: `~10–30 min · Claude Code on the web drafts an advanced plan you can edit and approve. See ${CCR_TERMS_URL}`,
+  get description() { return getActiveProviderProfile() ? LOCAL_ULTRAPLAN_DESCRIPTION : `~10–30 min · Claude Code on the web drafts an advanced plan you can edit and approve. See ${CCR_TERMS_URL}`; },
   argumentHint: '<prompt>',
   isEnabled: () => true,
   load: () => Promise.resolve({

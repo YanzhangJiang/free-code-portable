@@ -4,12 +4,12 @@ import { getGlobalConfig } from './config.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
+import { resolveProviderModel } from '../providers/runtime.js'
+import { getProfileDefaultOutputTokens } from '../providers/context-budget.js'
+export { COMPACT_MAX_OUTPUT_TOKENS } from '../providers/context-budget.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
-
-// Maximum output tokens for compact operations
-export const COMPACT_MAX_OUTPUT_TOKENS = 20_000
 
 // Default max output tokens
 const MAX_OUTPUT_TOKENS_DEFAULT = 32_000
@@ -33,6 +33,8 @@ export function is1mContextDisabled(): boolean {
 }
 
 export function has1mContext(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (configured) return configured.model.contextWindow >= 1_000_000
   if (is1mContextDisabled()) {
     return false
   }
@@ -41,6 +43,8 @@ export function has1mContext(model: string): boolean {
 
 // @[MODEL LAUNCH]: Update this pattern if the new model supports 1M context
 export function modelSupports1M(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (configured) return configured.model.contextWindow >= 1_000_000
   if (is1mContextDisabled()) {
     return false
   }
@@ -52,6 +56,8 @@ export function getContextWindowForModel(
   model: string,
   betas?: string[],
 ): number {
+  const configured = resolveProviderModel(model)
+  if (configured) return configured.model.contextWindow
   // Allow override via environment variable (ant-only)
   // This takes precedence over all other context window resolution, including 1M detection,
   // so users can cap the effective context window for local decisions (auto-compact, etc.)
@@ -98,6 +104,7 @@ export function getContextWindowForModel(
 }
 
 export function getSonnet1mExpTreatmentEnabled(model: string): boolean {
+  if (resolveProviderModel(model)) return false
   if (is1mContextDisabled()) {
     return false
   }
@@ -150,6 +157,16 @@ export function getModelMaxOutputTokens(model: string): {
   default: number
   upperLimit: number
 } {
+  const configured = resolveProviderModel(model)
+  if (configured) {
+    return {
+      default: getProfileDefaultOutputTokens(
+        configured.model.contextWindow,
+        configured.model.maxOutputTokens,
+      ),
+      upperLimit: configured.model.maxOutputTokens,
+    }
+  }
   let defaultTokens: number
   let upperLimit: number
 

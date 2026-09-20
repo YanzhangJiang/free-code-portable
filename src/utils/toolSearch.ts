@@ -1,9 +1,9 @@
 /**
  * Tool Search utilities for dynamically discovering deferred tools.
  *
- * When enabled, deferred tools (MCP and shouldDefer tools) are sent with
- * defer_loading: true and discovered via ToolSearchTool rather than being
- * loaded upfront.
+ * Deferred tools are discovered through ToolSearchTool rather than loaded
+ * upfront. Legacy providers use vendor tool_reference/defer_loading shapes;
+ * configured profiles use portable text results and selected full schemas.
  */
 
 import memoize from 'lodash-es/memoize.js'
@@ -13,6 +13,8 @@ import {
   logEvent,
 } from '../services/analytics/index.js'
 import type { Tool } from '../Tool.js'
+import { getExecutionProviderProfile, resolveProviderModel } from '../providers/runtime.js'
+import { extractLocalDiscoveredToolNames } from '../services/toolCatalog/discovery.js'
 import {
   type ToolPermissionContext,
   type Tools,
@@ -167,9 +169,10 @@ export type ToolSearchMode = 'tst' | 'tst-auto' | 'standard'
  *   auto / auto:1-99      tst-auto
  *   true / auto:0         tst
  *   false / auto:100      standard
- *   (unset)               tst (default: always defer MCP and shouldDefer tools)
+ *   (unset)               tst for legacy; tst-auto for configured profiles
  */
-export function getToolSearchMode(): ToolSearchMode {
+export function getToolSearchMode(model?: string): ToolSearchMode {
+  const localDiscovery = model ? Boolean(resolveProviderModel(model)) : Boolean(getExecutionProviderProfile())
   // CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is a kill switch for beta API
   // features. Tool search emits defer_loading on tool definitions and
   // tool_reference content blocks — both require the API to accept a beta
@@ -178,7 +181,7 @@ export function getToolSearchMode(): ToolSearchMode {
   // explicit escape hatch for proxy gateways that the heuristic in
   // isToolSearchEnabledOptimistic doesn't cover.
   // github.com/anthropics/claude-code/issues/20031
-  if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)) {
+  if (!localDiscovery && isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)) {
     return 'standard'
   }
 
@@ -194,7 +197,7 @@ export function getToolSearchMode(): ToolSearchMode {
 
   if (isEnvTruthy(value)) return 'tst'
   if (isEnvDefinedFalsy(process.env.ENABLE_TOOL_SEARCH)) return 'standard'
-  return 'tst' // default: always defer MCP and shouldDefer tools
+  return localDiscovery ? 'tst-auto' : 'tst' // Portable catalogs default to the 10% context threshold.
 }
 
 /**
@@ -237,6 +240,7 @@ function getUnsupportedToolReferencePatterns(): string[] {
  * @returns true if the model supports tool_reference, false otherwise
  */
 export function modelSupportsToolReference(model: string): boolean {
+  if (resolveProviderModel(model)) return false
   const normalizedModel = model.toLowerCase()
   const unsupportedPatterns = getUnsupportedToolReferencePatterns()
 
@@ -278,6 +282,9 @@ export function isToolSearchEnabledOptimistic(): boolean {
     }
     return false
   }
+  // Portable discovery emits normal text and full selected schemas, so it does
+  // not depend on the provider accepting Anthropic beta content types.
+  if (getExecutionProviderProfile()) return true
 
   // tool_reference is a beta content type that third-party API gateways
   // (ANTHROPIC_BASE_URL proxies) typically don't support. When the provider
@@ -365,7 +372,8 @@ async function calculateDeferredToolDescriptionChars(
 }
 
 /**
- * Check if tool search (MCP tool deferral with tool_reference) is enabled for a specific request.
+ * Check if tool discovery is enabled for a specific request. Configured profiles
+ * use a local catalog; legacy providers also require tool_reference support.
  *
  * This is the definitive check that includes:
  * - MCP mode (Tst, TstAuto, McpCli, Standard)
@@ -416,7 +424,7 @@ export async function isToolSearchEnabled(
   }
 
   // Check if model supports tool_reference
-  if (!modelSupportsToolReference(model)) {
+  if (!resolveProviderModel(model) && !modelSupportsToolReference(model)) {
     logForDebugging(
       `Tool search disabled for model '${model}': model does not support tool_reference blocks. ` +
         `This feature is only available on Claude Sonnet 4+, Opus 4+, and newer models.`,
@@ -434,7 +442,7 @@ export async function isToolSearchEnabled(
     return false
   }
 
-  const mode = getToolSearchMode()
+  const mode = getToolSearchMode(model)
 
   switch (mode) {
     case 'tst':
@@ -522,7 +530,8 @@ function isToolResultBlockWithContent(obj: unknown): obj is ToolResultBlock {
 }
 
 /**
- * Extract tool names from tool_reference blocks in message history.
+ * Extract tool names from legacy tool_reference blocks and portable local
+ * discovery results in this conversation's history.
  *
  * When dynamic tool loading is enabled, MCP tools are not predeclared in the
  * tools array. Instead, they are discovered via ToolSearchTool which returns
@@ -543,7 +552,7 @@ function isToolResultBlockWithContent(obj: unknown): obj is ToolResultBlock {
  * @returns Set of tool names that have been discovered via tool_reference blocks
  */
 export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
-  const discoveredTools = new Set<string>()
+  const discoveredTools = extractLocalDiscoveredToolNames(messages)
   let carriedFromBoundary = 0
 
   for (const msg of messages) {
@@ -627,6 +636,8 @@ export type DeferredToolsDeltaScanContext = {
  * header prepend (the attachment does not fire).
  */
 export function isDeferredToolsDeltaEnabled(): boolean {
+  // A local catalog advertises a bounded hint, not every registered tool name.
+  if (getExecutionProviderProfile()) return false
   return (
     process.env.USER_TYPE === 'ant' ||
     getFeatureValue_CACHED_MAY_BE_STALE('tengu_glacier_2xr', false)
@@ -720,12 +731,13 @@ async function checkAutoThreshold(
   metrics: Record<string, number>
 }> {
   // Try exact token count first (cached, one API call per toolset change)
-  const deferredToolTokens = await getDeferredToolTokenCount(
-    tools,
-    getToolPermissionContext,
-    agents,
-    model,
-  )
+  const deferredToolTokens = resolveProviderModel(model) ? null
+    : await getDeferredToolTokenCount(
+        tools,
+        getToolPermissionContext,
+        agents,
+        model,
+      )
 
   if (deferredToolTokens !== null) {
     const threshold = getAutoToolSearchTokenThreshold(model)

@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { isNativeReasoningBlock } from '../providers/messages.js'
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type {
   ContentBlock,
@@ -4789,7 +4790,7 @@ function filterTrailingThinkingFromLastAssistant(
 
   const content = lastMessage.message.content
   const lastBlock = content.at(-1)
-  if (!lastBlock || !isThinkingBlock(lastBlock)) {
+  if (!lastBlock || !isThinkingBlock(lastBlock) || isNativeReasoningBlock(lastBlock)) {
     return messages
   }
 
@@ -4797,7 +4798,7 @@ function filterTrailingThinkingFromLastAssistant(
   let lastValidIndex = content.length - 1
   while (lastValidIndex >= 0) {
     const block = content[lastValidIndex]
-    if (!block || !isThinkingBlock(block)) {
+    if (!block || !isThinkingBlock(block) || isNativeReasoningBlock(block)) {
       break
     }
     lastValidIndex--
@@ -5030,7 +5031,7 @@ export function filterOrphanedThinkingOnlyMessages(
       block => block.type === 'thinking' || block.type === 'redacted_thinking',
     )
 
-    if (!allThinking) {
+    if (!allThinking || content.some(isNativeReasoningBlock)) {
       return true // Has non-thinking content, keep it
     }
 

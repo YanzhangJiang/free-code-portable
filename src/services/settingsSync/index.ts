@@ -127,6 +127,8 @@ export function _resetDownloadPromiseForTesting(): void {
  * Returns true if settings were applied, false otherwise.
  */
 export function downloadUserSettings(): Promise<boolean> {
+  // Check before the cached legacy-account promise, including resolved results.
+  if (!isUsingOAuth()) return Promise.resolve(false)
   if (downloadPromise) {
     return downloadPromise
   }
@@ -150,6 +152,7 @@ export function downloadUserSettings(): Promise<boolean> {
  * settingsSync → changeDetector cycle edge.
  */
 export function redownloadUserSettings(): Promise<boolean> {
+  if (!isUsingOAuth()) return Promise.resolve(false)
   downloadPromise = doDownloadUserSettings(0)
   return downloadPromise
 }
@@ -228,6 +231,7 @@ function getSettingsSyncAuthHeaders(): {
   headers: Record<string, string>
   error?: string
 } {
+  if (!isUsingOAuth()) return { headers: {}, error: 'OAuth settings sync is unavailable for this provider' }
   const oauthTokens = getClaudeAIOAuthTokens()
   if (oauthTokens?.accessToken) {
     return {
@@ -246,6 +250,7 @@ function getSettingsSyncAuthHeaders(): {
 
 async function fetchUserSettingsOnce(): Promise<SettingsSyncFetchResult> {
   try {
+    if (!isUsingOAuth()) return { success: false, error: 'OAuth settings sync is unavailable for this provider', skipRetry: true }
     await checkAndRefreshOAuthTokenIfNeeded()
 
     const authHeaders = getSettingsSyncAuthHeaders()
@@ -348,6 +353,7 @@ async function uploadUserSettings(
   entries: Record<string, string>,
 ): Promise<SettingsSyncUploadResult> {
   try {
+    if (!isUsingOAuth()) return { success: false, error: 'OAuth settings sync is unavailable for this provider' }
     await checkAndRefreshOAuthTokenIfNeeded()
 
     const authHeaders = getSettingsSyncAuthHeaders()

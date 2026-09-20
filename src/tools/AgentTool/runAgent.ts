@@ -57,7 +57,8 @@ import { clearSessionHooks } from '../../utils/hooks/sessionHooks.js'
 import { executeSubagentStartHooks } from '../../utils/hooks.js'
 import { createUserMessage } from '../../utils/messages.js'
 import { getAgentModel } from '../../utils/model/agent.js'
-import type { ModelAlias } from '../../utils/model/aliases.js'
+import { createProviderExecutionContext } from '../../providers/runtime.js'
+import { bindProviderExecutionContext } from '../../providers/execution-context.js'
 import {
   clearAgentTranscriptSubdir,
   recordSidechainTranscript,
@@ -245,7 +246,24 @@ function isRecordableMessage(
   )
 }
 
-export async function* runAgent({
+export function runAgent(
+  params: Parameters<typeof runAgentInProviderContext>[0],
+): AsyncGenerator<Message, void> {
+  // Resolve before returning the iterator: a queued/background worker must retain
+  // its own model even if the main conversation changes before its first next().
+  const resolvedAgentModel = getAgentModel(
+    params.agentDefinition.model,
+    params.toolUseContext.options.mainLoopModel,
+    params.model,
+    params.toolUseContext.getAppState().toolPermissionContext.mode,
+  )
+  return bindProviderExecutionContext(
+    createProviderExecutionContext(resolvedAgentModel),
+    () => runAgentInProviderContext(params, resolvedAgentModel),
+  )
+}
+
+async function* runAgentInProviderContext({
   agentDefinition,
   promptMessages,
   toolUseContext,
@@ -285,7 +303,7 @@ export async function* runAgent({
     abortController?: AbortController
     agentId?: AgentId
   }
-  model?: ModelAlias
+  model?: string
   maxTurns?: number
   /** Preserve toolUseResult on messages for subagents with viewable transcripts */
   preserveToolUseResults?: boolean
@@ -326,7 +344,7 @@ export async function* runAgent({
    * during long single-block streams (e.g. thinking) where no assistant
    * message is yielded for >60s. */
   onQueryProgress?: () => void
-}): AsyncGenerator<Message, void> {
+}, resolvedAgentModel: string): AsyncGenerator<Message, void> {
   // Track subagent usage for feature discovery
 
   const appState = toolUseContext.getAppState()
@@ -336,13 +354,6 @@ export async function* runAgent({
   // so session-scoped writes (hooks, bash tasks) must go through this instead.
   const rootSetAppState =
     toolUseContext.setAppStateForTasks ?? toolUseContext.setAppState
-
-  const resolvedAgentModel = getAgentModel(
-    agentDefinition.model,
-    toolUseContext.options.mainLoopModel,
-    model,
-    permissionMode,
-  )
 
   const agentId = override?.agentId ? override.agentId : createAgentId()
 

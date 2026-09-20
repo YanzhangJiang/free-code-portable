@@ -18,7 +18,9 @@ import type {
   BetaMessageParam as MessageParam,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import type { TextBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
-import type { Stream } from '@anthropic-ai/sdk/streaming.mjs'
+import type { ProviderEventStream } from '../../providers/client.js'
+import { readProviderMetadata } from '../../providers/messages.js'
+import { getLocalToolCatalogHint } from '../toolCatalog/discovery.js'
 import { randomUUID } from 'crypto'
 import {
   getAPIProvider,
@@ -107,6 +109,8 @@ const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
   : null
 
 import { feature } from 'bun:bundle'
+import { createProviderExecutionContext, resolveProviderModel } from '../../providers/runtime.js'
+import { bindProviderExecutionContext, runWithProviderExecutionContext } from '../../providers/execution-context.js'
 import type { ClientOptions } from '@anthropic-ai/sdk'
 import {
   APIConnectionTimeoutError,
@@ -149,6 +153,7 @@ import type { AgentId } from 'src/types/ids.js'
 import {
   ADVISOR_TOOL_INSTRUCTIONS,
   getExperimentAdvisorModels,
+  getLocalAdvisorInstructions,
   isAdvisorEnabled,
   isValidAdvisorModel,
   modelSupportsAdvisor,
@@ -228,7 +233,7 @@ import {
 import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
-import { CLIENT_REQUEST_ID_HEADER, getAnthropicClient } from './client.js'
+import { CLIENT_REQUEST_ID_HEADER, getProviderClient } from './client.js'
 import {
   API_ERROR_MESSAGE_PREFIX,
   CUSTOM_OFF_SWITCH_MESSAGE,
@@ -333,6 +338,8 @@ export function getExtraBodyParams(betaHeaders?: string[]): JsonObject {
 export function getPromptCachingEnabled(model: string): boolean {
   // Global disable takes precedence
   if (isEnvTruthy(process.env.DISABLE_PROMPT_CACHING)) return false
+  const configured = resolveProviderModel(model)
+  if (configured) return configured.model.promptCaching === 'ephemeral'
 
   // Check if we should disable for small/fast model
   if (isEnvTruthy(process.env.DISABLE_PROMPT_CACHING_HAIKU)) {
@@ -391,6 +398,8 @@ export function getCacheControl({
  * TTLs when GrowthBook's disk cache updates mid-request.
  */
 function should1hCacheTTL(querySource?: QuerySource): boolean {
+  // Profiles opt into standard ephemeral markers, never account/experiment TTLs.
+  if (resolveProviderModel()) return false
   // 3P Bedrock users get 1h TTL when opted in via env var — they manage their own billing
   // No GrowthBook gating needed since 3P users don't have GrowthBook configured
   if (
@@ -543,7 +552,7 @@ export async function verifyApiKey(
     return await returnValue(
       withRetry(
         () =>
-          getAnthropicClient({
+          getProviderClient({
             apiKey,
             maxRetries: 3,
             model,
@@ -552,7 +561,7 @@ export async function verifyApiKey(
         async anthropic => {
           const messages: MessageParam[] = [{ role: 'user', content: 'test' }]
           // biome-ignore lint/plugin: API key verification is intentionally a minimal direct call
-          await anthropic.beta.messages.create({
+          await anthropic.createMessage({
             model,
             max_tokens: 1,
             messages,
@@ -706,7 +715,16 @@ export type Options = {
   taskBudget?: { total: number; remaining?: number }
 }
 
-export async function queryModelWithoutStreaming({
+export function queryModelWithoutStreaming(
+  params: Parameters<typeof queryModelWithoutStreamingInContext>[0],
+): Promise<AssistantMessage> {
+  return runWithProviderExecutionContext(
+    createProviderExecutionContext(params.options.model),
+    () => queryModelWithoutStreamingInContext(params),
+  )
+}
+
+async function queryModelWithoutStreamingInContext({
   messages,
   systemPrompt,
   thinkingConfig,
@@ -749,7 +767,16 @@ export async function queryModelWithoutStreaming({
   return assistantMessage
 }
 
-export async function* queryModelWithStreaming({
+export function queryModelWithStreaming(
+  params: Parameters<typeof queryModelWithStreamingInContext>[0],
+): ReturnType<typeof queryModelWithStreamingInContext> {
+  return bindProviderExecutionContext(
+    createProviderExecutionContext(params.options.model),
+    () => queryModelWithStreamingInContext(params),
+  )
+}
+
+async function* queryModelWithStreamingInContext({
   messages,
   systemPrompt,
   thinkingConfig,
@@ -823,6 +850,7 @@ export async function* executeNonStreamingRequest(
   },
   retryOptions: {
     model: string
+    maxOutputTokens?: number
     fallbackModel?: string
     thinkingConfig: ThinkingConfig
     fastMode?: boolean
@@ -842,7 +870,7 @@ export async function* executeNonStreamingRequest(
   const fallbackTimeoutMs = getNonstreamingFallbackTimeoutMs()
   const generator = withRetry(
     () =>
-      getAnthropicClient({
+      getProviderClient({
         maxRetries: 0,
         model: clientOptions.model,
         fetchOverride: clientOptions.fetchOverride,
@@ -861,16 +889,17 @@ export async function* executeNonStreamingRequest(
 
       try {
         // biome-ignore lint/plugin: non-streaming API call
-        return await anthropic.beta.messages.create(
+        return (await anthropic.createMessage(
           {
             ...adjustedParams,
+            stream: false,
             model: normalizeModelStringForAPI(adjustedParams.model),
           },
           {
             signal: retryOptions.signal,
             timeout: fallbackTimeoutMs,
           },
-        )
+        )).data
       } catch (err) {
         // User aborts are not errors — re-throw immediately without logging
         if (err instanceof APIUserAbortError) throw err
@@ -896,6 +925,7 @@ export async function* executeNonStreamingRequest(
     },
     {
       model: retryOptions.model,
+      maxOutputTokens: retryOptions.maxOutputTokens ?? getMaxOutputTokensForModel(retryOptions.model),
       fallbackModel: retryOptions.fallbackModel,
       thinkingConfig: retryOptions.thinkingConfig,
       ...(isFastModeEnabled() && { fastMode: retryOptions.fastMode }),
@@ -1068,20 +1098,22 @@ async function* queryModel(
     options.querySource === 'sdk' ||
     options.querySource === 'hook_agent' ||
     options.querySource === 'verification_agent'
-  const betas = getMergedBetas(options.model, { isAgenticQuery })
+  const betas = getMergedBetas(options.model, { isAgenticQuery }).filter(
+    beta => beta !== ADVISOR_BETA_HEADER || !resolveProviderModel(options.model),
+  )
 
   // Always send the advisor beta header when advisor is enabled, so
   // non-agentic queries (compact, side_question, extract_memories, etc.)
   // can parse advisor server_tool_use blocks already in the conversation history.
-  if (isAdvisorEnabled()) {
+  if (isAdvisorEnabled(options.model)) {
     betas.push(ADVISOR_BETA_HEADER)
   }
 
   let advisorModel: string | undefined
-  if (isAgenticQuery && isAdvisorEnabled()) {
+  if (isAgenticQuery && isAdvisorEnabled(options.model)) {
     let advisorOption = options.advisorModel
 
-    const advisorExperiment = getExperimentAdvisorModels()
+    const advisorExperiment = getExperimentAdvisorModels(options.model)
     if (advisorExperiment !== undefined) {
       if (
         normalizeModelStringForAPI(advisorExperiment.baseModel) ===
@@ -1094,7 +1126,7 @@ async function* queryModel(
       }
     }
 
-    if (advisorOption) {
+    if (advisorOption && !resolveProviderModel(advisorOption)) {
       const normalizedAdvisorModel = normalizeModelStringForAPI(
         parseUserSpecifiedModel(advisorOption),
       )
@@ -1149,6 +1181,7 @@ async function* queryModel(
 
   // Filter out ToolSearchTool if tool search is not enabled for this model
   // ToolSearchTool returns tool_reference blocks which unsupported models can't handle
+  const useLocalToolSearch = useToolSearch && Boolean(resolveProviderModel(options.model))
   let filteredTools: Tools
 
   if (useToolSearch) {
@@ -1174,7 +1207,7 @@ async function* queryModel(
   // Add tool search beta header if enabled - required for defer_loading to be accepted
   // Header differs by provider: 1P/Foundry use advanced-tool-use, Vertex/Bedrock use tool-search-tool
   // For Bedrock, this header must go in extraBodyParams, not the betas array
-  const toolSearchHeader = useToolSearch ? getToolSearchBetaHeader() : null
+  const toolSearchHeader = useToolSearch && !useLocalToolSearch ? getToolSearchBetaHeader() : null
   if (toolSearchHeader && getAPIProvider() !== 'bedrock') {
     if (!betas.includes(toolSearchHeader)) {
       betas.push(toolSearchHeader)
@@ -1204,9 +1237,9 @@ async function* queryModel(
     )
   }
 
-  const useGlobalCacheFeature = shouldUseGlobalCacheScope()
+  const useGlobalCacheFeature = shouldUseGlobalCacheScope(options.model)
   const willDefer = (t: Tool) =>
-    useToolSearch && (deferredToolNames.has(t.name) || shouldDeferLspTool(t))
+    useToolSearch && !useLocalToolSearch && (deferredToolNames.has(t.name) || shouldDeferLspTool(t))
   // MCP tools are per-user → dynamic tool section → can't globally cache.
   // Only gate when an MCP tool will actually render (not defer_loading).
   const needsToolBasedCacheMarker =
@@ -1280,7 +1313,7 @@ async function* queryModel(
   // Note: For assistant messages, normalizeMessagesForAPI already normalized the
   // tool inputs, so stripCallerFieldFromAssistantMessage only needs to remove the
   // 'caller' field (not re-normalize inputs).
-  if (!useToolSearch) {
+  if (!useToolSearch || useLocalToolSearch) {
     messagesForAPI = messagesForAPI.map(msg => {
       switch (msg.type) {
         case 'user':
@@ -1327,7 +1360,12 @@ async function* queryModel(
   // When the delta attachment is enabled, deferred tools are announced
   // via persisted deferred_tools_delta attachments instead of this
   // ephemeral prepend (which busts cache whenever the pool changes).
-  if (useToolSearch && !isDeferredToolsDeltaEnabled()) {
+  if (useLocalToolSearch) {
+    messagesForAPI = [
+      createUserMessage({ content: getLocalToolCatalogHint(deferredToolNames.size), isMeta: true }),
+      ...messagesForAPI,
+    ]
+  } else if (useToolSearch && !isDeferredToolsDeltaEnabled()) {
     const deferredToolList = tools
       .filter(t => deferredToolNames.has(t.name))
       .map(formatDeferredToolLine)
@@ -1357,13 +1395,17 @@ async function* queryModel(
   // filter(Boolean) works by converting each element to a boolean - empty strings become false and are filtered out.
   systemPrompt = asSystemPrompt(
     [
-      getAttributionHeader(fingerprint),
+      getAttributionHeader(fingerprint, options.model),
       getCLISyspromptPrefix({
+        model: options.model,
         isNonInteractive: options.isNonInteractiveSession,
         hasAppendSystemPrompt: options.hasAppendSystemPrompt,
       }),
       ...systemPrompt,
       ...(advisorModel ? [ADVISOR_TOOL_INSTRUCTIONS] : []),
+      // Reviewer children do not recursively spawn more reviewers.
+      ...(options.querySource.startsWith('repl_main_thread') || options.querySource === 'sdk'
+        ? [getLocalAdvisorInstructions(options.model, options.advisorModel, filteredTools)] : []),
       ...(injectChromeHere ? [CHROME_TOOL_SEARCH_INSTRUCTIONS] : []),
     ].filter(Boolean),
   )
@@ -1414,7 +1456,7 @@ async function* queryModel(
     if (
       !afkHeaderLatched &&
       isAgenticQuery &&
-      shouldIncludeFirstPartyOnlyBetas() &&
+      shouldIncludeFirstPartyOnlyBetas(options.model) &&
       (autoModeStateModule?.isAutoModeActive() ?? false)
     ) {
       afkHeaderLatched = true
@@ -1506,7 +1548,7 @@ async function* queryModel(
   let start = Date.now()
   let attemptNumber = 0
   const attemptStartTimes: number[] = []
-  let stream: Stream<BetaRawMessageStreamEvent> | undefined = undefined
+  let stream: ProviderEventStream<BetaRawMessageStreamEvent> | undefined = undefined
   let streamRequestId: string | null | undefined = undefined
   let clientRequestId: string | undefined = undefined
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins -- Response is available in Node 18+ and is used by the SDK
@@ -1661,7 +1703,7 @@ async function* queryModel(
     if (feature('TRANSCRIPT_CLASSIFIER')) {
       if (
         afkHeaderLatched &&
-        shouldIncludeFirstPartyOnlyBetas() &&
+        shouldIncludeFirstPartyOnlyBetas(retryContext.model) &&
         isAgenticQuery &&
         !betasParams.includes(AFK_MODE_BETA_HEADER)
       ) {
@@ -1777,7 +1819,7 @@ async function* queryModel(
     queryCheckpoint('query_client_creation_start')
     const generator = withRetry(
       () =>
-        getAnthropicClient({
+        getProviderClient({
           maxRetries: 0, // Disabled auto-retry in favor of manual implementation
           model: options.model,
           fetchOverride: options.fetchOverride,
@@ -1819,8 +1861,7 @@ async function* queryModel(
         // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
         // since we handle tool input accumulation ourselves
         // biome-ignore lint/plugin: main conversation loop handles attribution separately
-        const result = await anthropic.beta.messages
-          .create(
+        const result = await anthropic.streamMessages(
             { ...params, stream: true },
             {
               signal,
@@ -1829,14 +1870,14 @@ async function* queryModel(
               }),
             },
           )
-          .withResponse()
         queryCheckpoint('query_response_headers_received')
-        streamRequestId = result.request_id
+        streamRequestId = result.requestId
         streamResponse = result.response
         return result.data
       },
       {
         model: options.model,
+        maxOutputTokens: options.maxOutputTokensOverride ?? getMaxOutputTokensForModel(options.model),
         fallbackModel: options.fallbackModel,
         thinkingConfig,
         ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
@@ -1854,7 +1895,7 @@ async function* queryModel(
         yield e.value
       }
     } while (!e.done)
-    stream = e.value as Stream<BetaRawMessageStreamEvent>
+    stream = e.value as ProviderEventStream<BetaRawMessageStreamEvent>
 
     // reset state
     newMessages.length = 0
@@ -2189,6 +2230,12 @@ async function* queryModel(
               })
               throw new Error('Message not found')
             }
+            // Keep native continuation state attached to the completed block.
+            // Its adapter validates origin and content before replaying it.
+            const nativeMetadata = readProviderMetadata(
+              (part as unknown as { providerMetadata?: unknown }).providerMetadata,
+            )
+            if (nativeMetadata) Object.assign(contentBlock, { providerMetadata: nativeMetadata })
             const m: AssistantMessage = {
               message: {
                 ...partialMessage,
@@ -2552,6 +2599,7 @@ async function* queryModel(
         { model: options.model, source: options.querySource },
         {
           model: options.model,
+          maxOutputTokens: options.maxOutputTokensOverride ?? getMaxOutputTokensForModel(options.model),
           fallbackModel: options.fallbackModel,
           thinkingConfig,
           ...(isFastModeEnabled() && { fastMode: isFastMode }),
@@ -2651,6 +2699,7 @@ async function* queryModel(
           { model: options.model, source: options.querySource },
           {
             model: options.model,
+            maxOutputTokens: options.maxOutputTokensOverride ?? getMaxOutputTokensForModel(options.model),
             fallbackModel: options.fallbackModel,
             thinkingConfig,
             ...(isFastModeEnabled() && { fastMode: isFastMode }),
@@ -2896,7 +2945,7 @@ async function* queryModel(
  * @internal Exported for testing
  */
 export function cleanupStream(
-  stream: Stream<BetaRawMessageStreamEvent> | undefined,
+  stream: ProviderEventStream<BetaRawMessageStreamEvent> | undefined,
 ): void {
   if (!stream) {
     return

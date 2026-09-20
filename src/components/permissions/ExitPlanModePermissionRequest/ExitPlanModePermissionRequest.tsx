@@ -8,6 +8,8 @@ import { useAppState, useAppStateStore, useSetAppState } from 'src/state/AppStat
 import { getSdkBetas, getSessionId, isSessionPersistenceDisabled, setHasExitedPlanMode, setNeedsAutoModeExitAttachment, setNeedsPlanModeExitAttachment } from '../../../bootstrap/state.js';
 import { generateSessionName } from '../../../commands/rename/generateSessionName.js';
 import { launchUltraplan } from '../../../commands/ultraplan.js';
+import { buildLocalUltraplanPrompt } from '../../../commands/localUltraplan.js';
+import { getActiveProviderProfile } from '../../../providers/runtime.js';
 import type { KeyboardEvent } from '../../../ink/events/keyboard-event.js';
 import { Box, Text } from '../../../ink.js';
 import type { AppState } from '../../../state/AppStateStore.js';
@@ -141,7 +143,8 @@ export function ExitPlanModePermissionRequest({
   // selecting it would dismiss the dialog and reject locally before
   // launchUltraplan can notice the session exists and return "already polling".
   // feature() must sit directly in an if/ternary (bun:bundle DCE constraint).
-  const showUltraplan = feature('ULTRAPLAN') ? !ultraplanSessionUrl && !ultraplanLaunching : false;
+  const useLocalUltraplan = Boolean(getActiveProviderProfile());
+  const showUltraplan = useLocalUltraplan || (feature('ULTRAPLAN') ? !ultraplanSessionUrl && !ultraplanLaunching : false);
   const usage = toolUseConfirm.assistantMessage.message.usage;
   const {
     mode,
@@ -151,11 +154,12 @@ export function ExitPlanModePermissionRequest({
   const options = useMemo(() => buildPlanApprovalOptions({
     showClearContext,
     showUltraplan,
+    useLocalUltraplan,
     usedPercent: showClearContext ? getContextUsedPercent(usage, mode) : null,
     isAutoModeAvailable,
     isBypassPermissionsModeAvailable,
     onFeedbackChange: setPlanFeedback
-  }), [showClearContext, showUltraplan, usage, mode, isAutoModeAvailable, isBypassPermissionsModeAvailable]);
+  }), [showClearContext, showUltraplan, useLocalUltraplan, usage, mode, isAutoModeAvailable, isBypassPermissionsModeAvailable]);
   function onImagePaste(base64Image: string, mediaType?: string, filename?: string, dimensions?: ImageDimensions, _sourcePath?: string) {
     const pasteId = nextPasteIdRef.current++;
     const newContent: PastedContent = {
@@ -275,9 +279,8 @@ export function ExitPlanModePermissionRequest({
     const trimmedFeedback = planFeedback.trim();
     const acceptFeedback = trimmedFeedback || undefined;
 
-    // Ultraplan: reject locally, teleport the plan to CCR as a seed draft.
-    // Dialog dismisses immediately so the query loop unblocks; the teleport
-    // runs detached and its launch message lands via the command queue.
+    // Profile refinement stays in this permission-controlled plan loop. Legacy
+    // refinement rejects locally and sends the draft to the hosted planner.
     if (value === 'ultraplan') {
       logEvent('tengu_plan_exit', {
         planLengthChars: currentPlan.length,
@@ -287,6 +290,10 @@ export function ExitPlanModePermissionRequest({
       });
       onDone();
       onReject();
+      if (getActiveProviderProfile()) {
+        toolUseConfirm.onReject(buildLocalUltraplanPrompt('', currentPlan));
+        return;
+      }
       toolUseConfirm.onReject('Plan being refined via Ultraplan — please wait for the result.');
       void launchUltraplan({
         blurb: '',
@@ -674,6 +681,7 @@ export function ExitPlanModePermissionRequest({
 export function buildPlanApprovalOptions({
   showClearContext,
   showUltraplan,
+  useLocalUltraplan = false,
   usedPercent,
   isAutoModeAvailable,
   isBypassPermissionsModeAvailable,
@@ -681,6 +689,7 @@ export function buildPlanApprovalOptions({
 }: {
   showClearContext: boolean;
   showUltraplan: boolean;
+  useLocalUltraplan?: boolean;
   usedPercent: number | null;
   isAutoModeAvailable: boolean | undefined;
   isBypassPermissionsModeAvailable: boolean | undefined;
@@ -730,7 +739,7 @@ export function buildPlanApprovalOptions({
   });
   if (showUltraplan) {
     options.push({
-      label: 'No, refine with Ultraplan on Claude Code on the web',
+      label: useLocalUltraplan ? 'No, refine the plan on this machine' : 'No, refine with Ultraplan on Claude Code on the web',
       value: 'ultraplan'
     });
   }

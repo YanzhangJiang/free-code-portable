@@ -10,6 +10,20 @@ const sessionTranscriptModule = feature('KAIROS')
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 import { markPostCompaction } from 'src/bootstrap/state.js'
 import { getInvokedSkillsForAgent } from '../../bootstrap/state.js'
+import {
+  calculateRestorationBudget,
+  POST_COMPACT_TOKEN_BUDGET,
+  POST_COMPACT_MAX_TOKENS_PER_FILE,
+  POST_COMPACT_MAX_TOKENS_PER_SKILL,
+  POST_COMPACT_SKILLS_TOKEN_BUDGET,
+} from '../../providers/context-budget.js'
+export {
+  POST_COMPACT_TOKEN_BUDGET,
+  POST_COMPACT_MAX_TOKENS_PER_FILE,
+  POST_COMPACT_MAX_TOKENS_PER_SKILL,
+  POST_COMPACT_SKILLS_TOKEN_BUDGET,
+} from '../../providers/context-budget.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
 import type { QuerySource } from '../../constants/querySource.js'
 import type { CanUseToolFn } from '../../hooks/useCanUseTool.js'
 import type { Tool, ToolUseContext } from '../../Tool.js'
@@ -39,7 +53,6 @@ import {
   getMcpInstructionsDeltaAttachment,
 } from '../../utils/attachments.js'
 import { getMemoryPath } from '../../utils/config.js'
-import { COMPACT_MAX_OUTPUT_TOKENS } from '../../utils/context.js'
 import {
   analyzeContext,
   tokenStatsToStatsigMetrics,
@@ -96,10 +109,7 @@ import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
 } from '../analytics/index.js'
-import {
-  getMaxOutputTokensForModel,
-  queryModelWithStreaming,
-} from '../api/claude.js'
+import { queryModelWithStreaming } from '../api/claude.js'
 import {
   getPromptTooLongTokenGap,
   PROMPT_TOO_LONG_ERROR_MESSAGE,
@@ -113,6 +123,7 @@ import {
   roughTokenCountEstimationForMessages,
 } from '../tokenEstimation.js'
 import { groupMessagesByApiRound } from './grouping.js'
+import { getCompactionBudget } from './modelBudget.js'
 import {
   getCompactPrompt,
   getCompactUserSummaryMessage,
@@ -120,15 +131,26 @@ import {
 } from './prompt.js'
 
 export const POST_COMPACT_MAX_FILES_TO_RESTORE = 5
-export const POST_COMPACT_TOKEN_BUDGET = 50_000
-export const POST_COMPACT_MAX_TOKENS_PER_FILE = 5_000
-// Skills can be large (verify=18.7KB, claude-api=20.1KB). Previously re-injected
-// unbounded on every compact → 5-10K tok/compact. Per-skill truncation beats
-// dropping — instructions at the top of a skill file are usually the critical
-// part. Budget sized to hold ~5 skills at the per-skill cap.
-export const POST_COMPACT_MAX_TOKENS_PER_SKILL = 5_000
-export const POST_COMPACT_SKILLS_TOKEN_BUDGET = 25_000
 const MAX_COMPACT_STREAMING_RETRIES = 2
+
+function getBudgetedCompactPrompt(
+  model: string,
+  customInstructions?: string,
+  direction?: PartialCompactDirection,
+): string {
+  if (!resolveProviderModel(model)) {
+    return direction === undefined
+      ? getCompactPrompt(customInstructions)
+      : getPartialCompactPrompt(customInstructions, direction)
+  }
+  const scope = direction === 'from'
+    ? 'Summarize the recent messages; earlier context will be retained separately.'
+    : 'Summarize this conversation so the next turn can continue the work.'
+  const tokenTarget = Math.max(1, Math.floor(getCompactionBudget(model).summaryOutputTokens * 0.8))
+  return `${scope}
+Respond with the summary only, in at most ${tokenTarget} tokens. Do not call tools.
+Preserve the user's current objective and constraints, decisions, files changed and important paths, test results, unresolved errors, and concrete next steps. Preserve exact identifiers needed to continue. Distinguish completed work from planned work. Omit repeated history, large code excerpts, and internal deliberation.${customInstructions?.trim() ? `\n\nAdditional instructions:\n${customInstructions}` : ''}`
+}
 
 /**
  * Strip image blocks from user messages before sending for compaction.
@@ -432,12 +454,12 @@ export async function compactConversation(
     // Experiment (Jan 2026) confirmed: false path is 98% cache miss, costs ~0.76% of
     // fleet cache_creation (~38B tok/day), concentrated in ephemeral envs (CCR/GHA/SDK)
     // with cold GB cache and 3P providers where GB is disabled. GB gate kept as kill-switch.
-    const promptCacheSharingEnabled = getFeatureValue_CACHED_MAY_BE_STALE(
+    const promptCacheSharingEnabled = !resolveProviderModel(context.options.mainLoopModel) && getFeatureValue_CACHED_MAY_BE_STALE(
       'tengu_compact_cache_prefix',
       true,
     )
 
-    const compactPrompt = getCompactPrompt(customInstructions)
+    const compactPrompt = getBudgetedCompactPrompt(context.options.mainLoopModel, customInstructions)
     const summaryRequest = createUserMessage({
       content: compactPrompt,
     })
@@ -528,12 +550,18 @@ export async function compactConversation(
     // with EXPERIMENTAL_SKILL_SEARCH already skip re-injection via the
     // early-return in getSkillListingAttachments.
 
+    const restorationBudget = getRestorationBudget(
+      context.options.mainLoopModel, summary, messages, preCompactTokenCount,
+    )
+
     // Run async attachment generation in parallel
     const [fileAttachments, asyncAgentAttachments] = await Promise.all([
       createPostCompactFileAttachments(
         preCompactReadFileState,
         context,
         POST_COMPACT_MAX_FILES_TO_RESTORE,
+        [],
+        restorationBudget,
       ),
       createAsyncAgentAttachmentsIfNeeded(context),
     ])
@@ -555,7 +583,7 @@ export async function compactConversation(
     }
 
     // Add skill attachment if skills were invoked in this session
-    const skillAttachment = createSkillAttachmentIfNeeded(context.agentId)
+    const skillAttachment = createSkillAttachmentIfNeeded(context.agentId, restorationBudget)
     if (skillAttachment) {
       postCompactFileAttachments.push(skillAttachment)
     }
@@ -837,7 +865,7 @@ export async function partialCompactConversation(
     context.setResponseLength?.(() => 0)
     context.onCompactProgress?.({ type: 'compact_start' })
 
-    const compactPrompt = getPartialCompactPrompt(customInstructions, direction)
+    const compactPrompt = getBudgetedCompactPrompt(context.options.mainLoopModel, customInstructions, direction)
     const summaryRequest = createUserMessage({
       content: compactPrompt,
     })
@@ -922,12 +950,16 @@ export async function partialCompactConversation(
     // Intentionally NOT resetting sentSkillNames — see compactConversation()
     // for rationale (~4K tokens saved per compact event).
 
+    const restorationBudget = getRestorationBudget(
+      context.options.mainLoopModel, summary, allMessages, preCompactTokenCount, messagesToKeep,
+    )
     const [fileAttachments, asyncAgentAttachments] = await Promise.all([
       createPostCompactFileAttachments(
         preCompactReadFileState,
         context,
         POST_COMPACT_MAX_FILES_TO_RESTORE,
         messagesToKeep,
+        restorationBudget,
       ),
       createAsyncAgentAttachmentsIfNeeded(context),
     ])
@@ -947,7 +979,7 @@ export async function partialCompactConversation(
       postCompactFileAttachments.push(planModeAttachment)
     }
 
-    const skillAttachment = createSkillAttachmentIfNeeded(context.agentId)
+    const skillAttachment = createSkillAttachmentIfNeeded(context.agentId, restorationBudget)
     if (skillAttachment) {
       postCompactFileAttachments.push(skillAttachment)
     }
@@ -1151,8 +1183,9 @@ async function streamCompactSummary({
   // When prompt cache sharing is enabled, use forked agent to reuse the
   // main conversation's cached prefix (system prompt, tools, context messages).
   // Falls back to regular streaming path on failure.
-  // 3P default: true — see comment at the other tengu_compact_cache_prefix read above.
-  const promptCacheSharingEnabled = getFeatureValue_CACHED_MAY_BE_STALE(
+  // Profiles use the bounded summary request: inheriting the full tool schema
+  // and main-turn output allowance can itself fill a small model's window.
+  const promptCacheSharingEnabled = !resolveProviderModel(context.options.mainLoopModel) && getFeatureValue_CACHED_MAY_BE_STALE(
     'tengu_compact_cache_prefix',
     true,
   )
@@ -1314,10 +1347,7 @@ async function streamCompactSummary({
           toolChoice: undefined,
           isNonInteractiveSession: context.options.isNonInteractiveSession,
           hasAppendSystemPrompt: !!context.options.appendSystemPrompt,
-          maxOutputTokensOverride: Math.min(
-            COMPACT_MAX_OUTPUT_TOKENS,
-            getMaxOutputTokensForModel(context.options.mainLoopModel),
-          ),
+          maxOutputTokensOverride: getCompactionBudget(context.options.mainLoopModel).summaryOutputTokens,
           querySource: 'compact',
           agents: context.options.agentDefinitions.activeAgents,
           mcpTools: [],
@@ -1395,6 +1425,26 @@ async function streamCompactSummary({
   }
 }
 
+function getRestorationBudget(
+  model: string,
+  summary: string,
+  originalMessages: Message[],
+  preCompactTokenCount: number,
+  preservedMessages: Message[] = [],
+): ReturnType<typeof calculateRestorationBudget> | undefined {
+  if (!resolveProviderModel(model)) return undefined
+  // API usage includes system instructions and tool schemas; those survive
+  // compaction even though they are absent from the message payload estimate.
+  const fixedPromptTokens = Math.max(
+    0, preCompactTokenCount - roughTokenCountEstimationForMessages(originalMessages),
+  )
+  return calculateRestorationBudget(
+    getCompactionBudget(model),
+    fixedPromptTokens + roughTokenCountEstimation(summary) +
+      roughTokenCountEstimationForMessages(preservedMessages) + 512,
+  )
+}
+
 /**
  * Creates attachment messages for recently accessed files to restore them after compaction.
  * This prevents the model from having to re-read files that were recently accessed.
@@ -1417,7 +1467,11 @@ export async function createPostCompactFileAttachments(
   toolUseContext: ToolUseContext,
   maxFiles: number,
   preservedMessages: Message[] = [],
+  restorationBudget?: ReturnType<typeof calculateRestorationBudget>,
 ): Promise<AttachmentMessage[]> {
+  const tokenBudget = restorationBudget?.files ?? POST_COMPACT_TOKEN_BUDGET
+  const perFileBudget = restorationBudget?.perFile ?? POST_COMPACT_MAX_TOKENS_PER_FILE
+  if (tokenBudget === 0 || perFileBudget === 0) return []
   const preservedReadPaths = collectReadToolFilePaths(preservedMessages)
   const recentFiles = Object.entries(readFileState)
     .map(([filename, state]) => ({ filename, ...state }))
@@ -1438,7 +1492,7 @@ export async function createPostCompactFileAttachments(
         {
           ...toolUseContext,
           fileReadingLimits: {
-            maxTokens: POST_COMPACT_MAX_TOKENS_PER_FILE,
+            maxTokens: perFileBudget,
           },
         },
         'tengu_post_compact_file_restore_success',
@@ -1455,7 +1509,7 @@ export async function createPostCompactFileAttachments(
       return false
     }
     const attachmentTokens = roughTokenCountEstimation(jsonStringify(result))
-    if (usedTokens + attachmentTokens <= POST_COMPACT_TOKEN_BUDGET) {
+    if (usedTokens + attachmentTokens <= tokenBudget) {
       usedTokens += attachmentTokens
       return true
     }
@@ -1493,7 +1547,11 @@ export function createPlanAttachmentIfNeeded(
  */
 export function createSkillAttachmentIfNeeded(
   agentId?: string,
+  restorationBudget?: ReturnType<typeof calculateRestorationBudget>,
 ): AttachmentMessage | null {
+  const tokenBudget = restorationBudget?.skills ?? POST_COMPACT_SKILLS_TOKEN_BUDGET
+  const perSkillBudget = restorationBudget?.perSkill ?? POST_COMPACT_MAX_TOKENS_PER_SKILL
+  if (tokenBudget === 0 || perSkillBudget === 0) return null
   const invokedSkills = getInvokedSkillsForAgent(agentId)
 
   if (invokedSkills.size === 0) {
@@ -1511,12 +1569,12 @@ export function createSkillAttachmentIfNeeded(
       path: skill.skillPath,
       content: truncateToTokens(
         skill.content,
-        POST_COMPACT_MAX_TOKENS_PER_SKILL,
+        perSkillBudget,
       ),
     }))
     .filter(skill => {
-      const tokens = roughTokenCountEstimation(skill.content)
-      if (usedTokens + tokens > POST_COMPACT_SKILLS_TOKEN_BUDGET) {
+      const tokens = roughTokenCountEstimation(restorationBudget ? jsonStringify(skill) : skill.content)
+      if (usedTokens + tokens > tokenBudget) {
         return false
       }
       usedTokens += tokens
@@ -1666,6 +1724,9 @@ const SKILL_TRUNCATION_MARKER =
 function truncateToTokens(content: string, maxTokens: number): string {
   if (roughTokenCountEstimation(content) <= maxTokens) {
     return content
+  }
+  if (maxTokens * 4 <= SKILL_TRUNCATION_MARKER.length) {
+    return SKILL_TRUNCATION_MARKER.slice(0, maxTokens * 4)
   }
   const charBudget = maxTokens * 4 - SKILL_TRUNCATION_MARKER.length
   return content.slice(0, charBudget) + SKILL_TRUNCATION_MARKER

@@ -10,15 +10,21 @@ import {
   AuthenticationError,
 } from '@anthropic-ai/sdk'
 import { getModelStrings } from './modelStrings.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
 
 // Cache valid models to avoid repeated API calls
 const validModelCache = new Map<string, boolean>()
 
+export function clearModelValidationCache(): void {
+  validModelCache.clear()
+}
+
 /**
- * Validates a model by attempting an actual API call.
+ * Configured profiles validate locally; legacy custom models use an API probe.
  */
 export async function validateModel(
   model: string,
+  signal?: AbortSignal,
 ): Promise<{ valid: boolean; error?: string }> {
   const normalizedModel = model.trim()
 
@@ -32,6 +38,15 @@ export async function validateModel(
     return {
       valid: false,
       error: `Model '${normalizedModel}' is not in the list of available models`,
+    }
+  }
+
+  try {
+    if (resolveProviderModel(normalizedModel)) return { valid: true }
+  } catch (error) {
+    return {
+      valid: false,
+      error: error instanceof Error ? error.message : String(error),
     }
   }
 
@@ -64,6 +79,7 @@ export async function validateModel(
   try {
     await sideQuery({
       model: normalizedModel,
+      signal,
       max_tokens: 1,
       maxRetries: 0,
       querySource: 'model_validation',

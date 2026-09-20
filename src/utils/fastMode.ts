@@ -34,8 +34,10 @@ import {
   updateSettingsForSource,
 } from './settings/settings.js'
 import { createSignal } from './signal.js'
+import { getExecutionProviderProfile, resolveProviderModel } from '../providers/runtime.js'
 
 export function isFastModeEnabled(): boolean {
+  if (getExecutionProviderProfile()) return false
   return !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_FAST_MODE)
 }
 
@@ -167,6 +169,7 @@ export function getInitialFastModeSetting(model: ModelSetting): boolean {
 export function isFastModeSupportedByModel(
   modelSetting: ModelSetting,
 ): boolean {
+  if (resolveProviderModel(modelSetting)) return false
   if (!isFastModeEnabled()) {
     return false
   }

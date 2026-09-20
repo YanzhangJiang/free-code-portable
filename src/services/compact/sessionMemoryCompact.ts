@@ -3,6 +3,7 @@
  */
 
 import type { AgentId } from '../../types/ids.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
 import type { HookResultMessage, Message } from '../../types/message.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
@@ -40,6 +41,7 @@ import {
 } from './compact.js'
 import { estimateMessageTokens } from './microCompact.js'
 import { getCompactUserSummaryMessage } from './prompt.js'
+import { getCompactionBudget } from './modelBudget.js'
 
 /**
  * Configuration for session memory compaction thresholds
@@ -324,12 +326,11 @@ export function adjustIndexToPreserveAPIInvariants(
 export function calculateMessagesToKeepIndex(
   messages: Message[],
   lastSummarizedIndex: number,
+  config: SessionMemoryCompactConfig = getSessionMemoryCompactConfig(),
 ): number {
   if (messages.length === 0) {
     return 0
   }
-
-  const config = getSessionMemoryCompactConfig()
 
   // Start from the message after lastSummarizedIndex
   // If lastSummarizedIndex is -1 (not found) or messages.length (no summarized id),
@@ -441,6 +442,7 @@ function createCompactionResultFromSessionMemory(
   hookResults: HookResultMessage[],
   transcriptPath: string,
   agentId?: AgentId,
+  summaryTokenBudget?: number,
 ): CompactionResult {
   const preCompactTokenCount = tokenCountFromLastAPIResponse(messages)
 
@@ -458,8 +460,12 @@ function createCompactionResultFromSessionMemory(
 
   // Truncate oversized sections to prevent session memory from consuming
   // the entire post-compact token budget
-  const { truncatedContent, wasTruncated } =
+  let { truncatedContent, wasTruncated } =
     truncateSessionMemoryForCompact(sessionMemory)
+  if (summaryTokenBudget !== undefined && truncatedContent.length > summaryTokenBudget * 4) {
+    truncatedContent = truncatedContent.slice(0, summaryTokenBudget * 4)
+    wasTruncated = true
+  }
 
   let summaryContent = getCompactUserSummaryMessage(
     truncatedContent,
@@ -543,6 +549,12 @@ export async function trySessionMemoryCompaction(
   }
 
   try {
+    const model = getMainLoopModel()
+    const budget = resolveProviderModel(model) ? getCompactionBudget(model) : undefined
+    const config = getSessionMemoryCompactConfig()
+    const maxPreservedTokens = budget
+      ? Math.min(config.maxTokens, Math.max(1, Math.floor(budget.postCompactTargetTokens / 2)))
+      : config.maxTokens
     let lastSummarizedIndex: number
 
     if (lastSummarizedMessageId) {
@@ -571,6 +583,11 @@ export async function trySessionMemoryCompaction(
     const startIndex = calculateMessagesToKeepIndex(
       messages,
       lastSummarizedIndex,
+      {
+        ...config,
+        minTokens: budget ? Math.min(config.minTokens, Math.floor(maxPreservedTokens / 2)) : config.minTokens,
+        maxTokens: maxPreservedTokens,
+      },
     )
     // Filter out old compact boundary messages from messagesToKeep.
     // After REPL pruning, old boundaries re-yielded from messagesToKeep would
@@ -582,7 +599,7 @@ export async function trySessionMemoryCompaction(
 
     // Run session start hooks to restore CLAUDE.md and other context
     const hookResults = await processSessionStartHooks('compact', {
-      model: getMainLoopModel(),
+      model,
     })
 
     // Get transcript path for the summary message
@@ -595,11 +612,21 @@ export async function trySessionMemoryCompaction(
       hookResults,
       transcriptPath,
       agentId,
+      budget?.summaryOutputTokens,
     )
 
     const postCompactMessages = buildPostCompactMessages(compactionResult)
 
     const postCompactTokenCount = estimateMessageTokens(postCompactMessages)
+
+    // Unsummarized tool pairs must remain intact. If they or required hooks do
+    // not fit, let normal compaction summarize them rather than slice history.
+    if (budget) {
+      const fixedPromptTokens = Math.max(
+        0, tokenCountFromLastAPIResponse(messages) - estimateMessageTokens(messages),
+      )
+      if (postCompactTokenCount + fixedPromptTokens > budget.postCompactTargetTokens) return null
+    }
 
     // Only check threshold if one was provided (for autocompact)
     if (

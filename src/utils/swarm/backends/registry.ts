@@ -12,6 +12,10 @@ import { createInProcessBackend } from './InProcessBackend.js'
 import { getPreferTmuxOverIterm2 } from './it2Setup.js'
 import { createPaneBackendExecutor } from './PaneBackendExecutor.js'
 import { getTeammateModeFromSnapshot } from './teammateModeSnapshot.js'
+import {
+  assertPaneTeammateCredentials,
+  requiresInProcessTeammates,
+} from '../spawnUtils.js'
 import type {
   BackendDetectionResult,
   PaneBackend,
@@ -343,12 +347,13 @@ function getTeammateMode(): 'auto' | 'tmux' | 'in-process' {
  * - If teammateMode is 'in-process', always enabled
  * - If teammateMode is 'tmux', always disabled (use pane backend)
  * - If teammateMode is 'auto' (default), check environment:
+ *   - Profiles with apiKeyEnv use in-process to retain their credentials
  *   - If inside tmux, use pane backend (return false)
  *   - If inside iTerm2, use pane backend (return false) - detectAndGetBackend()
  *     will pick ITermBackend if it2 is available, or fall back to tmux
  *   - Otherwise, use in-process (return true)
  */
-export function isInProcessEnabled(): boolean {
+export function isInProcessEnabled(model?: string): boolean {
   // Force in-process mode for non-interactive sessions (-p mode)
   // since tmux-based teammates don't make sense without a terminal UI
   if (getIsNonInteractiveSession()) {
@@ -366,6 +371,7 @@ export function isInProcessEnabled(): boolean {
   } else if (mode === 'tmux') {
     enabled = false
   } else {
+    if (requiresInProcessTeammates(model)) return true
     // 'auto' mode - if a prior spawn fell back to in-process because no pane
     // backend was available, stay in-process (scoped to auto mode only so a
     // mid-session Settings change to explicit 'tmux' still takes effect).
@@ -425,12 +431,19 @@ export function getInProcessBackend(): TeammateExecutor {
 export async function getTeammateExecutor(
   preferInProcess: boolean = false,
 ): Promise<TeammateExecutor> {
-  if (preferInProcess && isInProcessEnabled()) {
+  if (getTeammateModeFromSnapshot() === 'tmux') {
+    assertPaneTeammateCredentials()
+  }
+  if (
+    (preferInProcess || requiresInProcessTeammates()) &&
+    isInProcessEnabled()
+  ) {
     logForDebugging('[BackendRegistry] Using in-process executor')
     return getInProcessBackend()
   }
 
   // Return pane backend executor
+  assertPaneTeammateCredentials()
   logForDebugging('[BackendRegistry] Using pane backend executor')
   return getPaneBackendExecutor()
 }

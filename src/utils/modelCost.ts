@@ -3,6 +3,7 @@ import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from 
 import { logEvent } from 'src/services/analytics/index.js'
 import { setHasUnknownModelCost } from '../bootstrap/state.js'
 import { isFastModeEnabled } from './fastMode.js'
+import { findQualifiedProviderModel } from '../providers/runtime.js'
 import {
   CLAUDE_3_5_HAIKU_CONFIG,
   CLAUDE_3_5_V2_SONNET_CONFIG,
@@ -87,6 +88,15 @@ export const COST_HAIKU_45 = {
 } as const satisfies ModelCosts
 
 const DEFAULT_UNKNOWN_MODEL_COST = COST_TIER_5_25
+// The numeric accumulator cannot represent an unknown amount. Keep its known
+// subtotal unchanged and mark it incomplete through setHasUnknownModelCost.
+const UNPRICED_MODEL_COST: ModelCosts = {
+  inputTokens: 0,
+  outputTokens: 0,
+  promptCacheWriteTokens: 0,
+  promptCacheReadTokens: 0,
+  webSearchRequests: 0,
+}
 
 /**
  * Get the cost tier for Opus 4.6 based on fast mode.
@@ -142,6 +152,30 @@ function tokensToUSDCost(modelCosts: ModelCosts, usage: Usage): number {
 }
 
 export function getModelCosts(model: string, usage: Usage): ModelCosts {
+  const configured = findQualifiedProviderModel(model)
+  if (configured) {
+    const costs = configured.model.cost
+    if (!costs) {
+      trackUnknownModelCost(model, configured.qualifiedModel)
+      return UNPRICED_MODEL_COST
+    }
+    if (
+      ((usage.cache_read_input_tokens ?? 0) > 0 &&
+        costs.cacheRead === undefined) ||
+      ((usage.cache_creation_input_tokens ?? 0) > 0 &&
+        costs.cacheWrite === undefined) ||
+      (usage.server_tool_use?.web_search_requests ?? 0) > 0
+    ) {
+      trackUnknownModelCost(model, configured.qualifiedModel)
+    }
+    return {
+      inputTokens: costs.input,
+      outputTokens: costs.output,
+      promptCacheReadTokens: costs.cacheRead ?? 0,
+      promptCacheWriteTokens: costs.cacheWrite ?? 0,
+      webSearchRequests: 0,
+    }
+  }
   const shortName = getCanonicalName(model)
 
   // Check if this is an Opus 4.6 model with fast mode active.
@@ -173,7 +207,8 @@ function trackUnknownModelCost(model: string, shortName: ModelShortName): void {
 }
 
 // Calculate the cost of a query in US dollars.
-// If the model's costs are not found, use the default model's costs.
+// Configured providers contribute known prices only; unknown charges mark the
+// session total incomplete. Legacy unknown models retain their original fallback.
 export function calculateUSDCost(resolvedModel: string, usage: Usage): number {
   const modelCosts = getModelCosts(resolvedModel, usage)
   return tokensToUSDCost(modelCosts, usage)
@@ -224,6 +259,13 @@ export function formatModelPricing(costs: ModelCosts): string {
  * Returns undefined if model is not found
  */
 export function getModelPricingString(model: string): string | undefined {
+  const configured = findQualifiedProviderModel(model)
+  if (configured) {
+    const costs = configured.model.cost
+    return costs
+      ? `${formatPrice(costs.input)}/${formatPrice(costs.output)} per Mtok`
+      : undefined
+  }
   const shortName = getCanonicalName(model)
   const costs = MODEL_COSTS[shortName]
   if (!costs) return undefined

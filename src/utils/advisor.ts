@@ -3,6 +3,8 @@ import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growt
 import { shouldIncludeFirstPartyOnlyBetas } from './betas.js'
 import { isEnvTruthy } from './envUtils.js'
 import { getInitialSettings } from './settings/settings.js'
+import { getActiveProviderProfile, getProviderProfiles, resolveProviderModel } from '../providers/runtime.js'
+import { AGENT_TOOL_NAME } from '../tools/AgentTool/constants.js'
 
 // The SDK does not yet have types for advisor blocks.
 // TODO(hackyon): Migrate to the real anthropic SDK types when this feature ships publicly
@@ -57,12 +59,13 @@ function getAdvisorConfig(): AdvisorConfig {
   )
 }
 
-export function isAdvisorEnabled(): boolean {
+export function isAdvisorEnabled(model?: string): boolean {
+  if (model ? resolveProviderModel(model) : getActiveProviderProfile()) return false
   if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL)) {
     return false
   }
   // The advisor beta header is first-party only (Bedrock/Vertex 400 on it).
-  if (!shouldIncludeFirstPartyOnlyBetas()) {
+  if (!shouldIncludeFirstPartyOnlyBetas(model)) {
     return false
   }
   return getAdvisorConfig().enabled ?? false
@@ -72,12 +75,12 @@ export function canUserConfigureAdvisor(): boolean {
   return isAdvisorEnabled() && (getAdvisorConfig().canUserConfigure ?? false)
 }
 
-export function getExperimentAdvisorModels():
+export function getExperimentAdvisorModels(model?: string):
   | { baseModel: string; advisorModel: string }
   | undefined {
+  if (!isAdvisorEnabled(model)) return undefined
   const config = getAdvisorConfig()
-  return isAdvisorEnabled() &&
-    !canUserConfigureAdvisor() &&
+  return !canUserConfigureAdvisor() &&
     config.baseModel &&
     config.advisorModel
     ? { baseModel: config.baseModel, advisorModel: config.advisorModel }
@@ -87,6 +90,7 @@ export function getExperimentAdvisorModels():
 // @[MODEL LAUNCH]: Add the new model if it supports the advisor tool.
 // Checks whether the main loop model supports calling the advisor tool.
 export function modelSupportsAdvisor(model: string): boolean {
+  if (resolveProviderModel(model)) return false
   const m = model.toLowerCase()
   return (
     m.includes('opus-4-6') ||
@@ -97,6 +101,7 @@ export function modelSupportsAdvisor(model: string): boolean {
 
 // @[MODEL LAUNCH]: Add the new model if it can serve as an advisor model.
 export function isValidAdvisorModel(model: string): boolean {
+  if (resolveProviderModel(model)) return false
   const m = model.toLowerCase()
   return (
     m.includes('opus-4-6') ||
@@ -110,6 +115,24 @@ export function getInitialAdvisorSetting(): string | undefined {
     return undefined
   }
   return getInitialSettings().advisorModel
+}
+
+/** A local reviewer is opt-in, session-scoped, and uses the normal Agent tool. */
+export function getLocalAdvisorInstructions(
+  model: string,
+  advisorModel: string | undefined,
+  tools: readonly { name: string }[],
+): string | undefined {
+  if (!resolveProviderModel(model) || !advisorModel || !tools.some(tool => tool.name === AGENT_TOOL_NAME)) return undefined
+  // Old Claude advisor aliases/settings must not silently start paid local tasks
+  // after switching providers. Only an explicitly selected profile/model applies.
+  const profile = getProviderProfiles().find(candidate => advisorModel.startsWith(`${candidate.id}/`))
+  if (!profile || !profile.models.some(candidate => `${profile.id}/${candidate.id}` === advisorModel)) return undefined
+  return `# Reviewer agent
+
+For substantive work, request an independent review with the ${AGENT_TOOL_NAME} tool before committing to an approach and before presenting completed changes. Use subagent_type="general-purpose", model=${JSON.stringify(advisorModel)}, and a prompt that states the question, relevant evidence, files, constraints, and expected review output. Ask the reviewer to inspect and advise without editing files. Wait for its result and assess the evidence before proceeding.
+
+This reviewer is a normal local Agent task using the configured model provider. It receives the context you supply through the Agent tool; it is not a server-side advisor and does not automatically receive the entire conversation. Normal tool permissions apply. If the Agent tool is denied or unavailable, explain that review could not run and continue only within the existing permissions.`
 }
 
 export function getAdvisorUsage(

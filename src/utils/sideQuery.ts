@@ -1,3 +1,5 @@
+import { createProviderExecutionContext } from '../providers/runtime.js'
+import { runWithProviderExecutionContext } from '../providers/execution-context.js'
 import type Anthropic from '@anthropic-ai/sdk'
 import type { BetaToolUnion } from '@anthropic-ai/sdk/resources/beta/messages.js'
 import {
@@ -13,7 +15,7 @@ import {
 import { logEvent } from '../services/analytics/index.js'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from '../services/analytics/metadata.js'
 import { getAPIMetadata } from '../services/api/claude.js'
-import { getAnthropicClient } from '../services/api/client.js'
+import { getProviderClient } from '../services/api/client.js'
 import { getModelBetas, modelSupportsStructuredOutputs } from './betas.js'
 import { computeFingerprint } from './fingerprint.js'
 import { normalizeModelStringForAPI } from './model/model.js'
@@ -104,7 +106,14 @@ function extractFirstUserMessageText(messages: MessageParam[]): string {
  * // Model validation
  * await sideQuery({ querySource: 'model_validation', model, max_tokens: 1, messages: [{ role: 'user', content: 'Hi' }] })
  */
-export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
+export function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
+  return runWithProviderExecutionContext(
+    createProviderExecutionContext(opts.model),
+    () => sideQueryInProviderContext(opts),
+  )
+}
+
+async function sideQueryInProviderContext(opts: SideQueryOptions): Promise<BetaMessage> {
   const {
     model,
     system,
@@ -121,7 +130,7 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
     stop_sequences,
   } = opts
 
-  const client = await getAnthropicClient({
+  const client = await getProviderClient({
     maxRetries,
     model,
     source: 'side_query',
@@ -141,7 +150,7 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
 
   // Compute fingerprint for OAuth attribution
   const fingerprint = computeFingerprint(messageText, MACRO.VERSION)
-  const attributionHeader = getAttributionHeader(fingerprint)
+  const attributionHeader = getAttributionHeader(fingerprint, model)
 
   // Build system as array to keep attribution header in its own block
   // (prevents server-side parsing from including system content in cc_entrypoint)
@@ -156,6 +165,7 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
             text: getCLISyspromptPrefix({
               isNonInteractive: false,
               hasAppendSystemPrompt: false,
+              model,
             }),
           },
         ]),
@@ -179,7 +189,7 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
   const normalizedModel = normalizeModelStringForAPI(model)
   const start = Date.now()
   // biome-ignore lint/plugin: this IS the wrapper that handles OAuth attribution
-  const response = await client.beta.messages.create(
+  const { data: response, requestId: providerRequestId } = await client.createMessage(
     {
       model: normalizedModel,
       max_tokens,
@@ -197,8 +207,7 @@ export async function sideQuery(opts: SideQueryOptions): Promise<BetaMessage> {
     { signal },
   )
 
-  const requestId =
-    (response as { _request_id?: string | null })._request_id ?? undefined
+  const requestId = providerRequestId ?? undefined
   const now = Date.now()
   const lastCompletion = getLastApiCompletionTimestamp()
   logEvent('tengu_api_success', {

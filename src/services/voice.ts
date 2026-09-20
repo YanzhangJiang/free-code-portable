@@ -10,6 +10,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { isEnvTruthy, isRunningOnHomespace } from '../utils/envUtils.js'
 import { logError } from '../utils/log.js'
 import { getPlatform } from '../utils/platform.js'
+import { ownRecordingProcess, type RecordingProcess } from './voice/recording-process.js'
 
 // Lazy-loaded native audio module. audio-capture.node links against
 // CoreAudio.framework + AudioUnit.framework; dlopen is synchronous and
@@ -357,21 +358,54 @@ export async function checkRecordingAvailability(): Promise<RecordingAvailabilit
 
 // ─── Recording (native audio on macOS/Linux/Windows, SoX/arecord fallback on Linux) ─────────────
 
-let activeRecorder: ChildProcess | null = null
+let activeRecorder: RecordingProcess | null = null
 let nativeRecordingActive = false
+let recordingGeneration = 0
+let recordingAbortSubscription: { signal: AbortSignal; listener: () => void } | null = null
+
+function removeRecordingAbortSubscription(): void {
+  if (recordingAbortSubscription) {
+    const { signal, listener } = recordingAbortSubscription
+    signal.removeEventListener('abort', listener)
+    recordingAbortSubscription = null
+  }
+}
 
 export async function startRecording(
   onData: (chunk: Buffer) => void,
   onEnd: () => void,
-  options?: { silenceDetection?: boolean },
+  options?: { silenceDetection?: boolean; signal?: AbortSignal },
 ): Promise<boolean> {
   logForDebugging(`[voice] startRecording called, platform=${process.platform}`)
+  stopRecording()
+  const generation = ++recordingGeneration
+  const isCancelled = () => options?.signal?.aborted || generation !== recordingGeneration
+  if (isCancelled()) return false
+  const receiveAudio = onData
+  const recordingEnded = onEnd
+  onData = chunk => { if (!isCancelled()) receiveAudio(chunk) }
+  onEnd = () => {
+    if (isCancelled()) return
+    removeRecordingAbortSubscription()
+    recordingEnded()
+  }
+  const ownRecording = (started: boolean): boolean => {
+    if (started && options?.signal) {
+      const listener = () => { if (generation === recordingGeneration) stopRecording() }
+      recordingAbortSubscription = { signal: options.signal, listener }
+      options.signal.addEventListener('abort', listener, { once: true })
+      if (options.signal.aborted) listener()
+    }
+    return started && !isCancelled()
+  }
 
   // Try native audio module first (macOS, Linux, Windows via cpal)
   const napi = await loadAudioNapi()
+  if (isCancelled()) return false
   const nativeAvailable =
     napi.isNativeAudioAvailable() &&
     (process.platform !== 'linux' || (await linuxHasAlsaCards()))
+  if (isCancelled()) return false
   const useSilenceDetection = options?.silenceDetection !== false
   if (nativeAvailable) {
     // Ensure any previous recording is fully stopped
@@ -384,6 +418,7 @@ export async function startRecording(
         onData(data)
       },
       () => {
+        if (isCancelled()) return
         if (useSilenceDetection) {
           nativeRecordingActive = false
           onEnd()
@@ -395,7 +430,7 @@ export async function startRecording(
     )
     if (started) {
       nativeRecordingActive = true
-      return true
+      return ownRecording(true)
     }
     // Native recording failed — fall through to platform fallbacks
   }
@@ -416,11 +451,13 @@ export async function startRecording(
     hasCommand('arecord') &&
     (await probeArecord()).ok
   ) {
-    return startArecordRecording(onData, onEnd)
+    if (isCancelled()) return false
+    return ownRecording(startArecordRecording(onData, onEnd))
   }
 
   // Fallback: SoX rec (Linux, or macOS if native module unavailable)
-  return startSoxRecording(onData, onEnd, options)
+  if (isCancelled()) return false
+  return ownRecording(startSoxRecording(onData, onEnd, options))
 }
 
 function startSoxRecording(
@@ -470,25 +507,16 @@ function startSoxRecording(
     stdio: ['pipe', 'pipe', 'pipe'],
   })
 
-  activeRecorder = child
-
-  child.stdout?.on('data', (chunk: Buffer) => {
-    onData(chunk)
+  const recorder = ownRecordingProcess(child, {
+    onData,
+    onError: logError,
+    onEnd: () => {
+      if (activeRecorder !== recorder) return
+      activeRecorder = null
+      onEnd()
+    },
   })
-
-  // Consume stderr to prevent backpressure
-  child.stderr?.on('data', () => {})
-
-  child.on('close', () => {
-    activeRecorder = null
-    onEnd()
-  })
-
-  child.on('error', err => {
-    logError(err)
-    activeRecorder = null
-    onEnd()
-  })
+  activeRecorder = recorder
 
   return true
 }
@@ -517,37 +545,31 @@ function startArecordRecording(
     stdio: ['pipe', 'pipe', 'pipe'],
   })
 
-  activeRecorder = child
-
-  child.stdout?.on('data', (chunk: Buffer) => {
-    onData(chunk)
+  const recorder = ownRecordingProcess(child, {
+    onData,
+    onError: logError,
+    onEnd: () => {
+      if (activeRecorder !== recorder) return
+      activeRecorder = null
+      onEnd()
+    },
   })
-
-  // Consume stderr to prevent backpressure
-  child.stderr?.on('data', () => {})
-
-  child.on('close', () => {
-    activeRecorder = null
-    onEnd()
-  })
-
-  child.on('error', err => {
-    logError(err)
-    activeRecorder = null
-    onEnd()
-  })
+  activeRecorder = recorder
 
   return true
 }
 
 export function stopRecording(): void {
+  recordingGeneration++
+  removeRecordingAbortSubscription()
   if (nativeRecordingActive && audioNapi) {
     audioNapi.stopNativeRecording()
     nativeRecordingActive = false
     return
   }
   if (activeRecorder) {
-    activeRecorder.kill('SIGTERM')
+    const recorder = activeRecorder
     activeRecorder = null
+    recorder.close()
   }
 }

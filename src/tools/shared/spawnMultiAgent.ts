@@ -24,7 +24,6 @@ import { getCwd } from '../../utils/cwd.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { errorMessage } from '../../utils/errors.js'
 import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
-import { parseUserSpecifiedModel } from '../../utils/model/model.js'
 import type { PermissionMode } from '../../utils/permissions/PermissionMode.js'
 import { isTmuxAvailable } from '../../utils/swarm/backends/detection.js'
 import {
@@ -49,7 +48,11 @@ import {
   type InProcessSpawnConfig,
   spawnInProcessTeammate,
 } from '../../utils/swarm/spawnInProcess.js'
-import { buildInheritedEnvVars } from '../../utils/swarm/spawnUtils.js'
+import {
+  buildInheritedEnvVars,
+  buildInheritedProviderCliFlags,
+  assertPaneTeammateCredentials,
+} from '../../utils/swarm/spawnUtils.js'
 import {
   readTeamFileAsync,
   sanitizeAgentName,
@@ -63,23 +66,11 @@ import {
   isInsideTmux,
   sendCommandToPane,
 } from '../../utils/swarm/teammateLayoutManager.js'
-import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js'
+import { resolveTeammateModelSelection } from '../../utils/swarm/teammateModel.js'
 import { registerTask } from '../../utils/task/framework.js'
 import { writeToMailbox } from '../../utils/teammateMailbox.js'
 import type { CustomAgentDefinition } from '../AgentTool/loadAgentsDir.js'
 import { isCustomAgent } from '../AgentTool/loadAgentsDir.js'
-
-function getDefaultTeammateModel(leaderModel: string | null): string {
-  const configured = getGlobalConfig().teammateDefaultModel
-  if (configured === null) {
-    // User picked "Default" in the /config picker — follow the leader.
-    return leaderModel ?? getHardcodedTeammateModelFallback()
-  }
-  if (configured !== undefined) {
-    return parseUserSpecifiedModel(configured)
-  }
-  return getHardcodedTeammateModelFallback()
-}
 
 /**
  * Resolve a teammate model value. Handles the 'inherit' alias (from agent
@@ -94,10 +85,11 @@ export function resolveTeammateModel(
   inputModel: string | undefined,
   leaderModel: string | null,
 ): string {
-  if (inputModel === 'inherit') {
-    return leaderModel ?? getDefaultTeammateModel(leaderModel)
-  }
-  return inputModel ?? getDefaultTeammateModel(leaderModel)
+  return resolveTeammateModelSelection(
+    inputModel,
+    leaderModel,
+    getGlobalConfig().teammateDefaultModel,
+  )
 }
 
 // ============================================================================
@@ -208,8 +200,9 @@ function getTeammateCommand(): string {
 function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
   permissionMode?: PermissionMode
+  model?: string
 }): string {
-  const flags: string[] = []
+  const flags = buildInheritedProviderCliFlags(options?.model)
   const { planModeRequired, permissionMode } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
@@ -231,7 +224,7 @@ function buildInheritedCliFlags(options?: {
   }
 
   // Propagate --model if explicitly set via CLI
-  const modelOverride = getMainLoopModelOverride()
+  const modelOverride = options?.model ?? getMainLoopModelOverride()
   if (modelOverride) {
     flags.push(`--model ${quote([modelOverride])}`)
   }
@@ -415,23 +408,11 @@ async function handleSpawnSplitPane(
 
   // Build CLI flags to propagate to teammate
   // Pass plan_mode_required to prevent inheriting bypass permissions
-  let inheritedFlags = buildInheritedCliFlags({
+  const inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
+    model,
   })
-
-  // If teammate has a custom model, add --model flag (or replace inherited one)
-  if (model) {
-    // Remove any inherited --model flag first
-    inheritedFlags = inheritedFlags
-      .split(' ')
-      .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
-      .join(' ')
-    // Add the teammate's model
-    inheritedFlags = inheritedFlags
-      ? `${inheritedFlags} --model ${quote([model])}`
-      : `--model ${quote([model])}`
-  }
 
   const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
   // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
@@ -622,23 +603,11 @@ async function handleSpawnSeparateWindow(
 
   // Build CLI flags to propagate to teammate
   // Pass plan_mode_required to prevent inheriting bypass permissions
-  let inheritedFlags = buildInheritedCliFlags({
+  const inheritedFlags = buildInheritedCliFlags({
     planModeRequired: plan_mode_required,
     permissionMode: appState.toolPermissionContext.mode,
+    model,
   })
-
-  // If teammate has a custom model, add --model flag (or replace inherited one)
-  if (model) {
-    // Remove any inherited --model flag first
-    inheritedFlags = inheritedFlags
-      .split(' ')
-      .filter((flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model')
-      .join(' ')
-    // Add the teammate's model
-    inheritedFlags = inheritedFlags
-      ? `${inheritedFlags} --model ${quote([model])}`
-      : `--model ${quote([model])}`
-  }
 
   const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
   // Propagate env vars that teammates need but may not inherit from tmux split-window shells.
@@ -1041,10 +1010,19 @@ async function handleSpawn(
   input: SpawnInput,
   context: ToolUseContext,
 ): Promise<{ data: SpawnOutput }> {
-  // Check if in-process mode is enabled via feature flag
-  if (isInProcessEnabled()) {
-    return handleSpawnInProcess(input, context)
+  const model = resolveTeammateModel(
+    input.model,
+    context.getAppState().mainLoopModel,
+  )
+  const resolvedInput = { ...input, model }
+  if (getTeammateModeFromSnapshot() === 'tmux') {
+    assertPaneTeammateCredentials(model)
   }
+  // Check if in-process mode is enabled via feature flag
+  if (isInProcessEnabled(model)) {
+    return handleSpawnInProcess(resolvedInput, context)
+  }
+  assertPaneTeammateCredentials(model)
 
   // Pre-flight: ensure a pane backend is available before attempting pane-based spawn.
   // This handles auto-mode cases like iTerm2 without it2 or tmux installed, where
@@ -1065,16 +1043,16 @@ async function handleSpawn(
     // Record the fallback so isInProcessEnabled() reflects the actual mode
     // (fixes banner and other UI that would otherwise show tmux attach commands).
     markInProcessFallback()
-    return handleSpawnInProcess(input, context)
+    return handleSpawnInProcess(resolvedInput, context)
   }
 
   // Backend is available (and now cached) - proceed with pane spawning.
   // Any errors here (user cancellation, validation, etc.) propagate to the caller.
   const useSplitPane = input.use_splitpane !== false
   if (useSplitPane) {
-    return handleSpawnSplitPane(input, context)
+    return handleSpawnSplitPane(resolvedInput, context)
   }
-  return handleSpawnSeparateWindow(input, context)
+  return handleSpawnSeparateWindow(resolvedInput, context)
 }
 
 // ============================================================================

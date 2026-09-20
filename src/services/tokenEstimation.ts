@@ -24,8 +24,9 @@ import {
 import { jsonStringify } from '../utils/slowOperations.js'
 import { isToolReferenceBlock } from '../utils/toolSearch.js'
 import { getAPIMetadata, getExtraBodyParams } from './api/claude.js'
-import { getAnthropicClient } from './api/client.js'
+import { getProviderClient } from './api/client.js'
 import { withTokenCountVCR } from './vcr.js'
+import { preparePortableMessages } from '../providers/messages.js'
 
 // Minimal values for token counting with thinking enabled
 // API constraint: max_tokens must be greater than thinking.budget_tokens
@@ -158,7 +159,7 @@ export async function countMessagesTokensWithAPI(
         })
       }
 
-      const anthropic = await getAnthropicClient({
+      const anthropic = await getProviderClient({
         maxRetries: 1,
         model,
         source: 'count_tokens',
@@ -169,7 +170,7 @@ export async function countMessagesTokensWithAPI(
           ? betas.filter(b => VERTEX_COUNT_TOKENS_ALLOWED_BETAS.has(b))
           : betas
 
-      const response = await anthropic.beta.messages.countTokens({
+      const { data: response } = await anthropic.countTokens({
         model: normalizeModelStringForAPI(model),
         messages:
           // When we pass tools and no messages, we need to pass a dummy message
@@ -275,7 +276,7 @@ export async function countTokensViaHaikuFallback(
     isVertexGlobalEndpoint || isBedrockWithThinking || isVertexWithThinking
       ? getDefaultSonnetModel()
       : getSmallFastModel()
-  const anthropic = await getAnthropicClient({
+  const anthropic = await getProviderClient({
     maxRetries: 1,
     model,
     source: 'count_tokens',
@@ -299,7 +300,7 @@ export async function countTokensViaHaikuFallback(
       : betas
 
   // biome-ignore lint/plugin: token counting needs specialized parameters (thinking, betas) that sideQuery doesn't support
-  const response = await anthropic.beta.messages.create({
+  const { data: response } = await anthropic.createMessage({
     model: normalizeModelStringForAPI(model),
     max_tokens: containsThinking ? TOKEN_COUNT_MAX_TOKENS : 1,
     messages: messagesToSend,
@@ -448,6 +449,9 @@ async function countTokensWithBedrock({
   containsThinking: boolean
 }): Promise<number | null> {
   try {
+    // Strip transcript-only state before AWS serializes and signs the request.
+    messages = preparePortableMessages(messages)
+    containsThinking = hasThinkingBlocks(messages)
     const client = await createBedrockRuntimeClient()
     // Bedrock CountTokens requires a model ID, not an inference profile / ARN
     const modelId = isFoundationModel(model)

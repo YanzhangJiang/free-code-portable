@@ -116,6 +116,11 @@ export function formatDeferredToolLine(tool: Tool): string {
   return tool.name
 }
 
-export function getPrompt(): string {
+export function getPrompt(local = false): string {
+  if (local) {
+    return `Searches this agent's available tools by name, description, and integration keywords. Matching tool schemas become available in the next request, so call ToolSearch before invoking a tool whose schema is not present. Discovery does not change tool permissions.
+
+Use "select:tool_name" or "select:tool_a,tool_b" for exact names, plain keywords such as "github pull request" to search, or "+github review" to require a term. Results are deterministic and limited to at most 20 tools; max_results defaults to 5. If there are no matches, refine the query. Tool results contain ordinary text; schemas are provided separately in the next request.`
+  }
   return PROMPT_HEAD + getToolLocationHint() + PROMPT_TAIL
 }

@@ -11,6 +11,7 @@ import {
 } from 'src/services/analytics/index.js'
 import { getModelStrings } from 'src/utils/model/modelStrings.js'
 import { getAPIProvider } from 'src/utils/model/providers.js'
+import { getExecutionProviderProfile } from '../providers/runtime.js'
 import {
   getIsNonInteractiveSession,
   preferThirdPartyAuthentication,
@@ -99,6 +100,7 @@ function isManagedOAuthContext(): boolean {
 /** Whether we are supporting direct 1P auth. */
 // this code is closely related to getAuthTokenSource
 export function isAnthropicAuthEnabled(): boolean {
+  if (getExecutionProviderProfile() || getAPIProvider() === 'openai') return false
   // --bare: API-key-only, never OAuth.
   if (isBareMode()) return false
 
@@ -1485,6 +1487,9 @@ export function checkAndRefreshOAuthTokenIfNeeded(
   retryCount = 0,
   force = false,
 ): Promise<boolean> {
+  if (getExecutionProviderProfile() || getAPIProvider() === 'openai') {
+    return Promise.resolve(false)
+  }
   // Deduplicate concurrent non-retry, non-force calls
   if (retryCount === 0 && !force) {
     if (pendingRefreshCheck) {
@@ -1627,6 +1632,8 @@ export function isClaudeAISubscriber(): boolean {
 }
 
 export function isCodexSubscriber(): boolean {
+  const profile = getExecutionProviderProfile()
+  if (profile && profile.api !== 'codex') return false
   // Only treat as Codex subscriber when explicitly using OpenAI provider
   if (getAPIProvider() !== 'openai') {
     return false

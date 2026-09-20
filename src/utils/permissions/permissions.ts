@@ -14,6 +14,7 @@ import { REPL_TOOL_NAME } from '../../tools/REPLTool/constants.js'
 import type { AssistantMessage } from '../../types/message.js'
 import { extractOutputRedirections } from '../bash/commands.js'
 import { logForDebugging } from '../debug.js'
+import { modelSupportsAutoMode } from '../betas.js'
 import { AbortError, toError } from '../errors.js'
 import { logError } from '../log.js'
 import { SandboxManager } from '../sandbox/sandbox-adapter.js'
@@ -519,6 +520,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
     // Check this BEFORE shouldAvoidPermissionPrompts so classifiers work in headless mode
     if (
       feature('TRANSCRIPT_CLASSIFIER') &&
+      modelSupportsAutoMode(context.options.mainLoopModel) &&
       (appState.toolPermissionContext.mode === 'auto' ||
         (appState.toolPermissionContext.mode === 'plan' &&
           (autoModeStateModule?.isAutoModeActive() ?? false)))
@@ -696,6 +698,7 @@ export const hasPermissionsToUseTool: CanUseToolFn = async (
           context.options.tools,
           appState.toolPermissionContext,
           context.abortController.signal,
+          context.options.mainLoopModel,
         )
       } finally {
         clearClassifierChecking(toolUseID)

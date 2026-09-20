@@ -27,6 +27,8 @@ export type Props = {
   showFastModeNotice?: boolean;
   /** Overrides the dim header line below "Select model". */
   headerText?: string;
+  /** Restrict choices for a consumer that cannot change the session provider. */
+  modelFilter?: (model: string | null) => boolean;
   /**
    * When true, skip writing effortLevel to userSettings on selection.
    * Used by the assistant installer wizard where the model choice is
@@ -46,7 +48,8 @@ export function ModelPicker(t0) {
     isStandaloneCommand,
     showFastModeNotice,
     headerText,
-    skipSettingsWrite
+    skipSettingsWrite,
+    modelFilter
   } = t0;
   const setAppState = useSetAppState();
   const exitState = useExitOnCtrlCDWithKeybindings();
@@ -73,10 +76,10 @@ export function ModelPicker(t0) {
   } else {
     t3 = $[3];
   }
-  const modelOptions = t3;
+  const modelOptions = useMemo(() => modelFilter ? t3.filter(option => modelFilter(option.value)) : t3, [t3, modelFilter]);
   let t4;
   bb0: {
-    if (initial !== null && !modelOptions.some(opt => opt.value === initial)) {
+    if (initial !== null && (!modelFilter || modelFilter(initial)) && !modelOptions.some(opt => opt.value === initial)) {
       let t5;
       if ($[4] !== initial) {
         t5 = modelDisplayString(initial);

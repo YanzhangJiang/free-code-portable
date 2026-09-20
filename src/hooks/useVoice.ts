@@ -1,10 +1,10 @@
-// React hook for hold-to-talk voice input using Anthropic voice_stream STT.
+// React hook for hold-to-talk voice input with independently configured STT.
 //
 // Hold the keybinding to record; release to stop and submit.  Auto-repeat
 // key events reset an internal timer — when no keypress arrives within
 // RELEASE_TIMEOUT_MS the recording stops automatically.  Uses the native
-// audio module (macOS) or SoX for recording, and Anthropic's voice_stream
-// endpoint (conversation_engine) for STT.
+// audio module or SoX/arecord for recording. The STT connection chooses a
+// configured file-transcription service or the legacy Anthropic stream.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useSetVoiceState } from '../context/voice.js'
@@ -26,6 +26,7 @@ import { getSystemLocaleLanguage } from '../utils/intl.js'
 import { logError } from '../utils/log.js'
 import { getInitialSettings } from '../utils/settings/settings.js'
 import { sleep } from '../utils/sleep.js'
+import { getExternalServices } from '../services/external/runtime.js'
 
 // ─── Language normalization ─────────────────────────────────────────────
 
@@ -118,13 +119,24 @@ const SUPPORTED_LANGUAGE_CODES = new Set([
 // default language if the input cannot be resolved.  When the input is
 // non-empty but unsupported, fellBackFrom is set to the original input so
 // callers can surface a warning.
-export function normalizeLanguageForSTT(language: string | undefined): {
+export function normalizeLanguageForSTT(language: string | undefined, portable = false): {
   code: string
   fellBackFrom?: string
 } {
   if (!language) return { code: DEFAULT_STT_LANGUAGE }
   const lower = language.toLowerCase().trim()
   if (!lower) return { code: DEFAULT_STT_LANGUAGE }
+  if (portable) {
+    const additionalNames: Record<string, string> = {
+      chinese: 'zh', mandarin: 'zh', '中文': 'zh', '简体中文': 'zh', '繁體中文': 'zh',
+      arabic: 'ar', 'العربية': 'ar', finnish: 'fi', hebrew: 'he', vietnamese: 'vi',
+      thai: 'th', 'ไทย': 'th', romanian: 'ro', hungarian: 'hu',
+    }
+    const name = additionalNames[lower] ?? LANGUAGE_NAME_TO_CODE[lower]
+    if (name) return { code: name }
+    const base = lower.split('-')[0]
+    if (base && /^[a-z]{2}$/.test(base)) return { code: base }
+  }
   if (SUPPORTED_LANGUAGE_CODES.has(lower)) return { code: lower }
   const fromName = LANGUAGE_NAME_TO_CODE[lower]
   if (fromName) return { code: fromName }
@@ -205,10 +217,12 @@ export function useVoice({
   const [state, setState] = useState<VoiceState>('idle')
   const stateRef = useRef<VoiceState>('idle')
   const connectionRef = useRef<VoiceStreamConnection | null>(null)
+  const recordingAbortRef = useRef<AbortController | null>(null)
   const accumulatedRef = useRef('')
   const onTranscriptRef = useRef(onTranscript)
   const onErrorRef = useRef(onError)
   const cleanupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // True once we've seen a second keypress (auto-repeat) while recording.
   // The OS key repeat delay (~500ms on macOS) means the first keypress is
@@ -287,9 +301,15 @@ export function useVoice({
     // voice during the replay window lets the stale replay open a WS,
     // accumulate transcript, and inject it after voice was torn down.
     sessionGenRef.current++
+    recordingAbortRef.current?.abort()
+    recordingAbortRef.current = null
     if (cleanupTimerRef.current) {
       clearTimeout(cleanupTimerRef.current)
       cleanupTimerRef.current = null
+    }
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = null
     }
     if (releaseTimerRef.current) {
       clearTimeout(releaseTimerRef.current)
@@ -401,7 +421,8 @@ export function useVoice({
           const replayBuffer = fullAudioRef.current
           await sleep(250)
           if (isStale()) return
-          const stt = normalizeLanguageForSTT(getInitialSettings().language)
+          const voice = getExternalServices().configuration.voice
+          const stt = normalizeLanguageForSTT(voice?.language ?? getInitialSettings().language, Boolean(voice))
           const keyterms = await getVoiceKeyterms()
           if (isStale()) return
           await new Promise<void>(resolve => {
@@ -442,7 +463,7 @@ export function useVoice({
                   })
                 },
               },
-              { language: stt.code, keyterms },
+              { language: stt.code, keyterms, signal: recordingAbortRef.current?.signal },
             ).then(
               c => {
                 if (!c) resolve()
@@ -501,7 +522,7 @@ export function useVoice({
           } else if (!hadAudioSignal) {
             // Distinguish silent mic (capture issue) from speech not recognized.
             onErrorRef.current?.(
-              'No audio detected from microphone. Check that the correct input device is selected and that Claude Code has microphone access.',
+              'No audio detected from microphone. Check that the correct input device is selected and that Free Code has microphone access.',
             )
           } else {
             onErrorRef.current?.('No speech detected.')
@@ -517,7 +538,11 @@ export function useVoice({
       })
       .catch(err => {
         logError(toError(err))
-        if (!isStale()) updateState('idle')
+        if (!isStale()) {
+          onErrorRef.current?.(toError(err).message)
+          cleanup()
+          updateState('idle')
+        }
       })
   }
 
@@ -656,9 +681,13 @@ export function useVoice({
     focusFlushedCharsRef.current = 0
     everConnectedRef.current = false
     const myGen = ++sessionGenRef.current
+    recordingAbortRef.current?.abort()
+    const sessionAbort = new AbortController()
+    recordingAbortRef.current = sessionAbort
 
     // ── Pre-check: can we actually record audio? ──────────────
     const availability = await voiceModule.checkRecordingAvailability()
+    if (sessionAbort.signal.aborted || sessionGenRef.current !== myGen || stateRef.current !== 'recording') return
     if (!availability.available) {
       logForDebugging(
         `[voice] Recording not available: ${availability.reason ?? 'unknown'}`,
@@ -698,7 +727,7 @@ export function useVoice({
         // Skip buffering in focus mode — replay is gated on !focusTriggered
         // so the buffer is dead weight (up to ~20MB for a 10min session).
         const owned = Buffer.from(chunk)
-        if (!focusTriggeredRef.current) {
+        if (!focusTriggeredRef.current && !getExternalServices().configuration.voice) {
           fullAudioRef.current.push(owned)
         }
         if (connectionRef.current) {
@@ -708,6 +737,9 @@ export function useVoice({
         }
         // Update audio level histogram for the recording visualizer
         const level = computeLevel(chunk)
+        if (getExternalServices().configuration.voice && focusTriggeredRef.current && level > 0.01) {
+          armFocusSilenceTimer()
+        }
         if (!hasAudioSignalRef.current && level > 0.01) {
           hasAudioSignalRef.current = true
         }
@@ -727,8 +759,10 @@ export function useVoice({
           finishRecording()
         }
       },
-      { silenceDetection: false },
+      { silenceDetection: false, signal: sessionAbort.signal },
     )
+
+    if (sessionAbort.signal.aborted || sessionGenRef.current !== myGen || stateRef.current !== 'recording') return
 
     if (!started) {
       logError(new Error('[voice] Recording failed — no audio tool found'))
@@ -744,8 +778,8 @@ export function useVoice({
       return
     }
 
-    const rawLanguage = getInitialSettings().language
-    const stt = normalizeLanguageForSTT(rawLanguage)
+    const rawLanguage = getExternalServices().configuration.voice?.language ?? getInitialSettings().language
+    const stt = normalizeLanguageForSTT(rawLanguage, Boolean(getExternalServices().configuration.voice))
     logEvent('tengu_voice_recording_started', {
       focusTriggered: focusTriggeredRef.current,
       sttLanguage:
@@ -777,6 +811,7 @@ export function useVoice({
     const isStale = () => sessionGenRef.current !== myGen
 
     const attemptConnect = (keyterms: string[]): void => {
+      if (isStale() || sessionAbort.signal.aborted || stateRef.current !== 'recording') return
       const myAttemptGen = attemptGenRef.current
       void connectVoiceStream(
         {
@@ -874,10 +909,12 @@ export function useVoice({
                   `[voice] early voice_stream error (pre-transcript), retrying once: ${error}`,
                 )
                 logEvent('tengu_voice_stream_early_retry', {})
+                connectionRef.current?.close()
                 connectionRef.current = null
                 attemptGenRef.current++
-                setTimeout(
+                retryTimerRef.current = setTimeout(
                   (stateRef, attemptConnect, keyterms) => {
+                    retryTimerRef.current = null
                     if (stateRef.current === 'recording') {
                       attemptConnect(keyterms)
                     }
@@ -977,6 +1014,7 @@ export function useVoice({
         {
           language: stt.code,
           keyterms,
+          signal: sessionAbort.signal,
         },
       ).then(conn => {
         if (isStale()) {
@@ -988,7 +1026,7 @@ export function useVoice({
             '[voice] Failed to connect to voice_stream (no OAuth token?)',
           )
           onErrorRef.current?.(
-            'Voice mode requires a Claude.ai account. Please run /login to sign in.',
+            'Configure voice in services.json, or run /login to use Claude.ai voice.',
           )
           // Clear the audio buffer on failure
           audioBuffer.length = 0
@@ -1004,6 +1042,12 @@ export function useVoice({
           conn.close()
           return
         }
+      }).catch(error => {
+        if (isStale()) return
+        onErrorRef.current?.(toError(error).message)
+        audioBuffer.length = 0
+        cleanup()
+        updateState('idle')
       })
     }
 

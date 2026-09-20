@@ -22,6 +22,7 @@
  */
 
 import { execFile } from 'child_process'
+import { getActiveProviderProfile } from '../../providers/runtime.js'
 import { isBareMode } from '../envUtils.js'
 import {
   CREDENTIALS_SERVICE_SUFFIX,
@@ -67,6 +68,7 @@ function spawnSecurity(serviceName: string): Promise<SpawnResult> {
  * immediately after startMdmRawRead(). Non-darwin is a no-op.
  */
 export function startKeychainPrefetch(): void {
+  if (getActiveProviderProfile()) return
   if (process.platform !== 'darwin' || prefetchPromise || isBareMode()) return
 
   // Fire both subprocesses immediately (non-blocking). They run in parallel

@@ -393,6 +393,7 @@ export async function classifyHandoffIfNeeded({
   abortSignal,
   subagentType,
   totalToolUseCount,
+  resolvedAgentModel,
 }: {
   agentMessages: MessageType[]
   tools: Tools
@@ -400,6 +401,7 @@ export async function classifyHandoffIfNeeded({
   abortSignal: AbortSignal
   subagentType: string
   totalToolUseCount: number
+  resolvedAgentModel: string
 }): Promise<string | null> {
   if (feature('TRANSCRIPT_CLASSIFIER')) {
     if (toolPermissionContext.mode !== 'auto') return null
@@ -421,6 +423,7 @@ export async function classifyHandoffIfNeeded({
       tools,
       toolPermissionContext as ToolPermissionContext,
       abortSignal,
+      resolvedAgentModel,
     )
 
     const handoffDecision = classifierResult.unavailable
@@ -613,6 +616,7 @@ export async function runAsyncAgentLifecycle({
         abortSignal: abortController.signal,
         subagentType: metadata.agentType,
         totalToolUseCount: agentResult.totalToolUseCount,
+        resolvedAgentModel: metadata.resolvedAgentModel,
       })
       if (handoffWarning) {
         finalMessage = `${handoffWarning}\n\n${finalMessage}`

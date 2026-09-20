@@ -51,6 +51,18 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Local relay owns startup and starts its CLI child with the requested configuration.
+  if (args[0] === 'local-remote') {
+    try {
+      const { localRemoteMain } = await import('./localRemote.js');
+      await localRemoteMain(args.slice(1));
+    } catch (error) {
+      process.stderr.write(`Local remote control: ${error instanceof Error ? error.message : 'startup failed'}\n`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
   // For all other paths, load the startup profiler
   const {
     profileCheckpoint
@@ -292,6 +304,21 @@ async function main(): Promise<void> {
   // option building (not just inside the action handler).
   if (args.includes('--bare')) {
     process.env.CLAUDE_CODE_SIMPLE = '1';
+  }
+
+  // Resolve user-owned provider configuration before auth/keychain and model
+  // modules initialize. Workspace settings never supply provider credentials.
+  const { parseProviderCommandLine } = await import('../providers/command-line.js');
+  const { initializeProviderRuntime } = await import('../providers/runtime.js');
+  const { initializeExternalServices } = await import('../services/external/runtime.js');
+  try {
+    const startupOptions = parseProviderCommandLine(args);
+    initializeProviderRuntime(startupOptions);
+    initializeExternalServices({ configPath: startupOptions.servicesPath });
+  } catch (error) {
+    process.stderr.write(`Provider/service configuration: ${error instanceof Error ? error.message : 'invalid configuration'}\n`);
+    process.exitCode = 1;
+    return;
   }
 
   // No special flags detected, load and run the full CLI

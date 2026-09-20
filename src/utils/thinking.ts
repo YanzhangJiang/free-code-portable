@@ -6,6 +6,7 @@ import { getCanonicalName } from './model/model.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getSettingsWithErrors } from './settings/settings.js'
+import { resolveProviderModel } from '../providers/runtime.js'
 
 export type ThinkingConfig =
   | { type: 'adaptive' }
@@ -88,6 +89,8 @@ export function getRainbowColor(
 // TODO(inigo): add support for probing unknown models via API error detection
 // Provider-aware thinking support detection (aligns with modelSupportsISP in betas.ts)
 export function modelSupportsThinking(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (configured) return configured.model.reasoning
   const supported3P = get3PModelCapabilityOverride(model, 'thinking')
   if (supported3P !== undefined) {
     return supported3P
@@ -100,7 +103,7 @@ export function modelSupportsThinking(model: string): boolean {
   // IMPORTANT: Do not change thinking support without notifying the model
   // launch DRI and research. This can greatly affect model quality and bashing.
   const canonical = getCanonicalName(model)
-  const provider = getAPIProvider()
+  const provider = getAPIProvider(model)
   // 1P and Foundry: all Claude 4+ models (including Haiku 4.5)
   if (provider === 'foundry' || provider === 'firstParty') {
     return !canonical.includes('claude-3-')
@@ -111,6 +114,13 @@ export function modelSupportsThinking(model: string): boolean {
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports adaptive thinking.
 export function modelSupportsAdaptiveThinking(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (configured) {
+    if (!configured.model.reasoning) return false
+    // Adaptive thinking is an Anthropic wire feature. Other protocols use
+    // their adapter's reasoning effort mapping instead of Claude heuristics.
+    if (getAPIProvider(model) === 'openai') return false
+  }
   const supported3P = get3PModelCapabilityOverride(model, 'adaptive_thinking')
   if (supported3P !== undefined) {
     return supported3P
@@ -139,11 +149,13 @@ export function modelSupportsAdaptiveThinking(model: string): boolean {
   // Default to true for unknown model strings on 1P and Foundry (because Foundry
   // is a proxy). Do not default to true for other 3P as they have different formats
   // for their model strings.
-  const provider = getAPIProvider()
+  const provider = getAPIProvider(model)
   return provider === 'firstParty' || provider === 'foundry'
 }
 
 export function shouldEnableThinkingByDefault(): boolean {
+  const configured = resolveProviderModel()
+  if (configured && !configured.model.reasoning) return false
   if (process.env.MAX_THINKING_TOKENS) {
     return parseInt(process.env.MAX_THINKING_TOKENS, 10) > 0
   }

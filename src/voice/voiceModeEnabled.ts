@@ -1,4 +1,5 @@
 import { feature } from 'bun:bundle'
+import { getExternalServices } from '../services/external/runtime.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../services/analytics/growthbook.js'
 import {
   getClaudeAIOAuthTokens,
@@ -6,7 +7,8 @@ import {
 } from '../utils/auth.js'
 
 /**
- * Kill-switch check for voice mode. Returns true unless the
+ * Build availability plus the legacy service kill-switch. Independent voice
+ * configurations bypass Anthropic's service controls. Otherwise returns true unless the
  * `tengu_amber_quartz_disabled` GrowthBook flag is flipped on (emergency
  * off). Default `false` means a missing/stale disk cache reads as "not
  * killed" — so fresh installs get voice working immediately without
@@ -18,18 +20,22 @@ export function isVoiceGrowthBookEnabled(): boolean {
   // Negative pattern (if (!feature(...)) return) does not eliminate
   // inline string literals from external builds.
   return feature('VOICE_MODE')
-    ? !getFeatureValue_CACHED_MAY_BE_STALE('tengu_amber_quartz_disabled', false)
+    ? Boolean(getExternalServices().configuration.voice) ||
+      !getFeatureValue_CACHED_MAY_BE_STALE('tengu_amber_quartz_disabled', false)
     : false
 }
 
 /**
- * Auth-only check for voice mode. Returns true when the user has a valid
- * Anthropic OAuth token. Backed by the memoized getClaudeAIOAuthTokens —
+ * Service availability check. An independent configuration needs no Anthropic
+ * account. Legacy voice requires a valid OAuth token, backed by memoized getClaudeAIOAuthTokens —
  * first call spawns `security` on macOS (~20-50ms), subsequent calls are
  * cache hits. The memoize clears on token refresh (~once/hour), so one
  * cold spawn per refresh is expected. Cheap enough for usage-time checks.
  */
 export function hasVoiceAuth(): boolean {
+  // Independent audio services may be local and unauthenticated. Any explicitly
+  // configured credential is validated at use time, without accessing OAuth.
+  if (getExternalServices().configuration.voice) return true
   // Voice mode requires Anthropic OAuth — it uses the voice_stream
   // endpoint on claude.ai which is not available with API keys,
   // Bedrock, Vertex, or Foundry.

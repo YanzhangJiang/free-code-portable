@@ -170,6 +170,7 @@ function getAuthHeaders(): {
   headers?: Record<string, string>
   error?: string
 } {
+  if (!isUsingOAuth()) return { error: 'OAuth team memory sync is unavailable for this provider' }
   const oauthTokens = getClaudeAIOAuthTokens()
   if (oauthTokens?.accessToken) {
     return {
@@ -191,6 +192,7 @@ async function fetchTeamMemoryOnce(
   etag?: string | null,
 ): Promise<TeamMemorySyncFetchResult> {
   try {
+    if (!isUsingOAuth()) return { success: false, error: 'OAuth team memory sync is unavailable for this provider', skipRetry: true, errorType: 'auth' }
     await checkAndRefreshOAuthTokenIfNeeded()
 
     const auth = getAuthHeaders()
@@ -317,6 +319,7 @@ async function fetchTeamMemoryHashes(
   repoSlug: string,
 ): Promise<TeamMemoryHashesResult> {
   try {
+    if (!isUsingOAuth()) return { success: false, error: 'OAuth team memory sync is unavailable for this provider', errorType: 'auth' }
     await checkAndRefreshOAuthTokenIfNeeded()
     const auth = getAuthHeaders()
     if (auth.error) {
@@ -466,6 +469,7 @@ async function uploadTeamMemory(
   ifMatchChecksum?: string | null,
 ): Promise<TeamMemorySyncUploadResult> {
   try {
+    if (!isUsingOAuth()) return { success: false, error: 'OAuth team memory sync is unavailable for this provider', errorType: 'auth' }
     await checkAndRefreshOAuthTokenIfNeeded()
 
     const auth = getAuthHeaders()

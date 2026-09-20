@@ -13,7 +13,7 @@ import {
   getClaudeAIOAuthTokens,
   getCodexOAuthTokens,
   isClaudeAISubscriber,
-  isCodexSubscriber,
+  saveCodexOAuthTokens,
   refreshAndGetAwsCredentials,
   refreshGcpCredentialsIfNeeded,
 } from 'src/utils/auth.js'
@@ -36,6 +36,29 @@ import {
   isEnvTruthy,
 } from '../../utils/envUtils.js'
 import { createCodexFetch } from './codex-fetch-adapter.js'
+import { createProfileClient, bindProfileRequest } from './profile-client.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
+import { refreshCodexToken } from '../oauth/codex-client.js'
+import { createCodexTokenSource } from '../oauth/codex-token-refresh.js'
+import { adaptMessagesClient, type AgentProviderClient } from './provider-client.js'
+
+/** The agent consumes this transport contract; legacy SDK details stay below it. */
+export async function getProviderClient(
+  options: Parameters<typeof getAnthropicClient>[0],
+): Promise<AgentProviderClient> {
+  const resolved = resolveProviderModel(options.model)
+  const preserveNativeHistory = resolved
+    ? ['anthropic', 'openai-completions', 'openai-responses', 'codex'].includes(resolved.profile.api)
+    : getAPIProvider(options.model) === 'openai'
+  return adaptMessagesClient(await getAnthropicClient(options), { preserveNativeHistory })
+}
+
+const getFreshCodexTokens = createCodexTokenSource({
+  read: getCodexOAuthTokens,
+  write: saveCodexOAuthTokens,
+  refresh: refreshCodexToken,
+  now: Date.now,
+})
 
 /**
  * Environment variables for different client types:
@@ -106,10 +129,46 @@ export async function getAnthropicClient({
   fetchOverride?: ClientOptions['fetch']
   source?: string
 }): Promise<Anthropic> {
+  const resolvedProfile = resolveProviderModel(model)
+  const provider = getAPIProvider(model)
+  if (resolvedProfile && (
+    resolvedProfile.profile.api === 'anthropic' ||
+    resolvedProfile.profile.api === 'openai-completions' ||
+    resolvedProfile.profile.api === 'openai-responses'
+  )) {
+    const inner = fetchOverride ?? globalThis.fetch
+    // Resolve transport policy once at the boundary. Generic providers inherit
+    // proxy/CA/mTLS support, but never the Anthropic Unix-socket tunnel.
+    const networkOptions = getProxyFetchOptions()
+    const transport = ((input: RequestInfo | URL, init?: RequestInit) =>
+      inner(input, { ...init, ...networkOptions })) as typeof globalThis.fetch
+    return createProfileClient(resolvedProfile, {
+      maxRetries,
+      fetch: transport,
+    })
+  }
+  if (provider === 'openai') {
+    const tokens = await getFreshCodexTokens()
+    const inner = fetchOverride ?? globalThis.fetch
+    const networkOptions = getProxyFetchOptions()
+    const transport = ((input: RequestInfo | URL, init?: RequestInit) =>
+      inner(input, { ...init, ...networkOptions })) as typeof globalThis.fetch
+    const codexFetch = createCodexFetch(tokens.accessToken, transport, resolvedProfile?.profile.id)
+    return new Anthropic({
+      apiKey: 'codex-placeholder',
+      authToken: null,
+      baseURL: 'https://api.anthropic.com',
+      maxRetries,
+      fetch: resolvedProfile ? bindProfileRequest(resolvedProfile, codexFetch) : codexFetch,
+    })
+  }
+  // Native cloud SDKs need the exact deployment ID before URL construction and
+  // request signing. Their caller still retains the qualified model identity.
+  if (resolvedProfile) model = resolvedProfile.model.id
   const containerId = process.env.CLAUDE_CODE_CONTAINER_ID
   const remoteSessionId = process.env.CLAUDE_CODE_REMOTE_SESSION_ID
   const clientApp = process.env.CLAUDE_AGENT_SDK_CLIENT_APP
-  const customHeaders = getCustomHeaders()
+  const customHeaders = resolvedProfile ? {} : getCustomHeaders()
   const defaultHeaders: { [key: string]: string } = {
     'x-app': 'cli',
     'User-Agent': getUserAgent(),
@@ -137,10 +196,10 @@ export async function getAnthropicClient({
   }
 
   logForDebugging('[API:auth] OAuth token check starting')
-  await checkAndRefreshOAuthTokenIfNeeded()
+  if (!resolvedProfile) await checkAndRefreshOAuthTokenIfNeeded()
   logForDebugging('[API:auth] OAuth token check complete')
 
-  if (!isClaudeAISubscriber()) {
+  if (!resolvedProfile && !isClaudeAISubscriber()) {
     await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
   }
 
@@ -158,7 +217,7 @@ export async function getAnthropicClient({
       fetch: resolvedFetch,
     }),
   }
-  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)) {
+  if (provider === 'bedrock') {
     const { AnthropicBedrock } = await import('@anthropic-ai/bedrock-sdk')
     // Use region override for small fast model if specified
     const awsRegion =
@@ -196,7 +255,7 @@ export async function getAnthropicClient({
     // we have always been lying about the return type - this doesn't support batching or models
     return new AnthropicBedrock(bedrockArgs) as unknown as Anthropic
   }
-  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
+  if (provider === 'foundry') {
     const { AnthropicFoundry } = await import('@anthropic-ai/foundry-sdk')
     // Determine Azure AD token provider based on configuration
     // SDK reads ANTHROPIC_FOUNDRY_API_KEY by default
@@ -226,7 +285,7 @@ export async function getAnthropicClient({
     // we have always been lying about the return type - this doesn't support batching or models
     return new AnthropicFoundry(foundryArgs) as unknown as Anthropic
   }
-  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)) {
+  if (provider === 'vertex') {
     // Refresh GCP credentials if gcpAuthRefresh is configured and credentials are expired
     // This is similar to how we handle AWS credential refresh for Bedrock
     if (!isEnvTruthy(process.env.CLAUDE_CODE_SKIP_VERTEX_AUTH)) {
@@ -303,21 +362,6 @@ export async function getAnthropicClient({
     }
     // we have always been lying about the return type - this doesn't support batching or models
     return new AnthropicVertex(vertexArgs) as unknown as Anthropic
-  }
-
-  // ── Codex (OpenAI) provider via fetch adapter ─────────────────────
-  if (isCodexSubscriber()) {
-    const codexTokens = getCodexOAuthTokens()
-    if (codexTokens?.accessToken) {
-      const codexFetch = createCodexFetch(codexTokens.accessToken)
-      const clientConfig: ConstructorParameters<typeof Anthropic>[0] = {
-        apiKey: 'codex-placeholder', // SDK requires a key but the fetch adapter handles auth
-        ...ARGS,
-        fetch: codexFetch as unknown as typeof globalThis.fetch,
-        ...(isDebugToStdErr() && { logger: createStderrLogger() }),
-      }
-      return new Anthropic(clientConfig)
-    }
   }
 
   // Determine authentication method based on available tokens

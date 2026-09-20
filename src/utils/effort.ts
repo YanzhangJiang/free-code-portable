@@ -7,6 +7,7 @@ import { getAPIProvider } from './model/providers.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
+import { resolveProviderModel } from '../providers/runtime.js'
 
 export type { EffortLevel }
 
@@ -21,6 +22,8 @@ export type EffortValue = EffortLevel | number
 
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (configured) return configured.model.reasoning
   const m = model.toLowerCase()
   if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
     return true
@@ -51,6 +54,13 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6 only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (
+    configured &&
+    (!configured.model.reasoning || getAPIProvider(model) === 'openai')
+  ) {
+    return false
+  }
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
   if (supported3P !== undefined) {
     return supported3P
@@ -153,6 +163,8 @@ export function resolveAppliedEffort(
   model: string,
   appStateEffortValue: EffortValue | undefined,
 ): EffortValue | undefined {
+  const configured = resolveProviderModel(model)
+  if (configured && !configured.model.reasoning) return undefined
   const envOverride = getEffortEnvOverride()
   if (envOverride === null) {
     return undefined
@@ -279,6 +291,9 @@ export function getOpusDefaultEffortConfig(): OpusDefaultEffortConfig {
 export function getDefaultEffortForModel(
   model: string,
 ): EffortValue | undefined {
+  // Provider reasoning defaults belong to its endpoint, not the user's
+  // Claude subscription or Anthropic experiment cohort.
+  if (resolveProviderModel(model)) return undefined
   if (process.env.USER_TYPE === 'ant') {
     const config = getAntModelOverrideConfig()
     const isDefaultModel =

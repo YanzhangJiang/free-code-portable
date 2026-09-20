@@ -1,4 +1,5 @@
 import { setMainLoopModelOverride } from '../bootstrap/state.js'
+import { getProviderProfiles } from '../providers/runtime.js'
 import {
   clearApiKeyHelperCache,
   clearAwsCredentialsCache,
@@ -97,7 +98,7 @@ export function onChangeAppState({
     newState.mainLoopModel === null
   ) {
     // Remove from settings
-    updateSettingsForSource('userSettings', { model: undefined })
+    if (getProviderProfiles().length === 0) updateSettingsForSource('userSettings', { model: undefined })
     setMainLoopModelOverride(null)
   }
 
@@ -107,7 +108,7 @@ export function onChangeAppState({
     newState.mainLoopModel !== null
   ) {
     // Save to settings
-    updateSettingsForSource('userSettings', { model: newState.mainLoopModel })
+    if (getProviderProfiles().length === 0) updateSettingsForSource('userSettings', { model: newState.mainLoopModel })
     setMainLoopModelOverride(newState.mainLoopModel)
   }
 

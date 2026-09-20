@@ -60,6 +60,12 @@ import { logForDebugging } from '../utils/debug.js'
 import { loadMemoryPrompt } from '../memdir/memdir.js'
 import { isUndercover } from '../utils/undercover.js'
 import { isMcpInstructionsDeltaEnabled } from '../utils/mcpInstructionsDelta.js'
+import { resolveProviderModel } from '../providers/runtime.js'
+import {
+  createProviderPromptPolicy,
+  describeProviderModel,
+} from '../providers/prompt-policy.js'
+import { isFastModeAvailable } from '../utils/fastMode.js'
 
 // Dead code elimination: conditional imports for feature-gated modules
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -447,9 +453,21 @@ export async function getSystemPrompt(
   additionalWorkingDirectories?: string[],
   mcpClients?: MCPServerConnection[],
 ): Promise<string[]> {
+  const resolvedModel = resolveProviderModel(model)
+  const enabledTools = new Set(tools.map(tool => tool.name))
+  const providerPolicy = resolvedModel
+    ? createProviderPromptPolicy(
+        resolvedModel.qualifiedModel,
+        resolvedModel.model,
+        enabledTools,
+      )
+    : undefined
   if (isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)) {
     return [
-      `You are Claude Code, Anthropic's official CLI for Claude.\n\nCWD: ${getCwd()}\nDate: ${getSessionStartDate()}`,
+      `${providerPolicy?.identity ?? "You are Claude Code, Anthropic's official CLI for Claude."}\n\nCWD: ${getCwd()}\nDate: ${getSessionStartDate()}`,
+      ...(providerPolicy
+        ? [providerPolicy.modelDescription, providerPolicy.toolInstructions]
+        : []),
     ]
   }
 
@@ -461,7 +479,33 @@ export async function getSystemPrompt(
   ])
 
   const settings = getInitialSettings()
-  const enabledTools = new Set(tools.map(_ => _.name))
+
+  // Profile prompts depend on the request's model and tools. They must not use
+  // the legacy session-wide section cache, which can retain a different model's
+  // identity or capabilities after switching or while subagents run.
+  if (providerPolicy) {
+    return [
+      providerPolicy.identity,
+      CYBER_RISK_INSTRUCTION,
+      providerPolicy.workingInstructions,
+      getActionsSection(),
+      providerPolicy.toolInstructions,
+      getHooksSection(),
+      await loadMemoryPrompt(),
+      envInfo,
+      getLanguageSection(settings.language),
+      getOutputStyleSection(outputStyleConfig),
+      isMcpInstructionsDeltaEnabled()
+        ? null
+        : getMcpInstructionsSection(mcpClients),
+      getScratchpadInstructions(),
+      SUMMARIZE_TOOL_RESULTS_SECTION,
+      (feature('PROACTIVE') || feature('KAIROS')) &&
+      proactiveModule?.isProactiveActive()
+        ? getProactiveSection()
+        : null,
+    ].filter(section => section !== null)
+  }
 
   if (
     (feature('PROACTIVE') || feature('KAIROS')) &&
@@ -617,8 +661,14 @@ export async function computeEnvInfo(
   // DCE: `process.env.USER_TYPE === 'ant'` is build-time --define. It MUST be
   // inlined at each callsite (not hoisted to a const) so the bundler can
   // constant-fold it to `false` in external builds and eliminate the branch.
+  const resolvedModel = resolveProviderModel(modelId)
   let modelDescription = ''
-  if (process.env.USER_TYPE === 'ant' && isUndercover()) {
+  if (resolvedModel) {
+    modelDescription = describeProviderModel(
+      resolvedModel.qualifiedModel,
+      resolvedModel.model,
+    )
+  } else if (process.env.USER_TYPE === 'ant' && isUndercover()) {
     // suppress
   } else {
     const marketingName = getMarketingNameForModel(modelId)
@@ -632,7 +682,7 @@ export async function computeEnvInfo(
       ? `Additional working directories: ${additionalWorkingDirectories.join(', ')}\n`
       : ''
 
-  const cutoff = getKnowledgeCutoff(modelId)
+  const cutoff = resolvedModel ? null : getKnowledgeCutoff(modelId)
   const knowledgeCutoffMessage = cutoff
     ? `\n\nAssistant knowledge cutoff is ${cutoff}.`
     : ''
@@ -656,8 +706,14 @@ export async function computeSimpleEnvInfo(
 
   // Undercover: strip all model name/ID references. See computeEnvInfo.
   // DCE: inline the USER_TYPE check at each site — do NOT hoist to a const.
+  const resolvedModel = resolveProviderModel(modelId)
   let modelDescription: string | null = null
-  if (process.env.USER_TYPE === 'ant' && isUndercover()) {
+  if (resolvedModel) {
+    modelDescription = describeProviderModel(
+      resolvedModel.qualifiedModel,
+      resolvedModel.model,
+    )
+  } else if (process.env.USER_TYPE === 'ant' && isUndercover()) {
     // suppress
   } else {
     const marketingName = getMarketingNameForModel(modelId)
@@ -666,7 +722,7 @@ export async function computeSimpleEnvInfo(
       : `You are powered by the model ${modelId}.`
   }
 
-  const cutoff = getKnowledgeCutoff(modelId)
+  const cutoff = resolvedModel ? null : getKnowledgeCutoff(modelId)
   const knowledgeCutoffMessage = cutoff
     ? `Assistant knowledge cutoff is ${cutoff}.`
     : null
@@ -691,13 +747,15 @@ export async function computeSimpleEnvInfo(
     `OS Version: ${unameSR}`,
     modelDescription,
     knowledgeCutoffMessage,
-    process.env.USER_TYPE === 'ant' && isUndercover()
+    resolvedModel || (process.env.USER_TYPE === 'ant' && isUndercover())
       ? null
       : `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
+    resolvedModel || (process.env.USER_TYPE === 'ant' && isUndercover())
       ? null
       : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
+    resolvedModel ||
+    !isFastModeAvailable() ||
+    (process.env.USER_TYPE === 'ant' && isUndercover())
       ? null
       : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
   ].filter(item => item !== null)
@@ -763,6 +821,14 @@ export async function enhanceSystemPromptWithEnvDetails(
   additionalWorkingDirectories?: string[],
   enabledToolNames?: ReadonlySet<string>,
 ): Promise<string[]> {
+  const resolvedModel = resolveProviderModel(model)
+  const providerPolicy = resolvedModel
+    ? createProviderPromptPolicy(
+        resolvedModel.qualifiedModel,
+        resolvedModel.model,
+        enabledToolNames ?? new Set(),
+      )
+    : undefined
   const notes = `Notes:
 - Agent threads always have their cwd reset between bash calls, as a result please only use absolute file paths.
 - In your final response, share file paths (always absolute, never relative) that are relevant to the task. Include code snippets only when the exact text is load-bearing (e.g., a bug you found, a function signature the caller asked for) — do not recap code you merely read.
@@ -783,7 +849,13 @@ export async function enhanceSystemPromptWithEnvDetails(
       : null
   const envInfo = await computeEnvInfo(model, additionalWorkingDirectories)
   return [
-    ...existingSystemPrompt,
+    ...(providerPolicy ? [providerPolicy.identity] : []),
+    ...existingSystemPrompt.map(prompt =>
+      providerPolicy && prompt === DEFAULT_AGENT_PROMPT
+        ? `${providerPolicy.workingInstructions}\nComplete the delegated task and return a concise report to the caller.`
+        : prompt,
+    ),
+    ...(providerPolicy ? [providerPolicy.toolInstructions] : []),
     notes,
     ...(discoverSkillsGuidance !== null ? [discoverSkillsGuidance] : []),
     envInfo,

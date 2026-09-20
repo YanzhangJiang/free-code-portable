@@ -273,7 +273,7 @@ function extractReviewFromLog(log: SDKMessage[]): string | null {
   // Hook-stdout concat fallback: a single echo should land in one event, but
   // large JSON payloads can flush across two if the pipe buffer fills
   // mid-write. Per-message scan above misses a tag split across events.
-  const hookStdout = log.filter(msg => msg.type === 'system' && (msg.subtype === 'hook_progress' || msg.subtype === 'hook_response')).map(msg => msg.stdout).join('');
+  const hookStdout = log.flatMap(msg => msg.type === 'system' && (msg.subtype === 'hook_progress' || msg.subtype === 'hook_response') && typeof msg.stdout === 'string' ? [msg.stdout] : []).join('');
   const hookTagged = extractTag(hookStdout, REMOTE_REVIEW_TAG);
   if (hookTagged?.trim()) return hookTagged.trim();
 
@@ -312,7 +312,7 @@ function extractReviewTagFromLog(log: SDKMessage[]): string | null {
   }
 
   // Hook-stdout concat fallback for split tags
-  const hookStdout = log.filter(msg => msg.type === 'system' && (msg.subtype === 'hook_progress' || msg.subtype === 'hook_response')).map(msg => msg.stdout).join('');
+  const hookStdout = log.flatMap(msg => msg.type === 'system' && (msg.subtype === 'hook_progress' || msg.subtype === 'hook_response') && typeof msg.stdout === 'string' ? [msg.stdout] : []).join('');
   const hookTagged = extractTag(hookStdout, REMOTE_REVIEW_TAG);
   if (hookTagged?.trim()) return hookTagged.trim();
   return null;

@@ -12,6 +12,7 @@ import { isEnvDefinedFalsy } from 'src/utils/envUtils.js'
 import { clearMcpAuthCache } from './client.js'
 import { normalizeNameForMCP } from './normalization.js'
 import type { ScopedMcpServerConfig } from './types.js'
+import { isClaudeAiMcpAllowed } from './claudeaiAccess.js'
 
 type ClaudeAIMcpServer = {
   type: 'mcp_server'
@@ -36,7 +37,7 @@ const MCP_SERVERS_BETA_HEADER = 'mcp-servers-2025-12-04'
  *
  * Results are memoized for the session lifetime (fetch once per CLI session).
  */
-export const fetchClaudeAIMcpConfigsIfEligible = memoize(
+const fetchEligibleClaudeAIMcpConfigs = memoize(
   async (): Promise<Record<string, ScopedMcpServerConfig>> => {
     try {
       if (isEnvDefinedFalsy(process.env.ENABLE_CLAUDEAI_MCP_SERVERS)) {
@@ -133,12 +134,19 @@ export const fetchClaudeAIMcpConfigsIfEligible = memoize(
   },
 )
 
+/** Check the current execution before consulting legacy account memoization. */
+export async function fetchClaudeAIMcpConfigsIfEligible(): Promise<Record<string, ScopedMcpServerConfig>> {
+  if (!isClaudeAiMcpAllowed()) return {}
+  const configs = await fetchEligibleClaudeAIMcpConfigs()
+  return isClaudeAiMcpAllowed() ? configs : {}
+}
+
 /**
  * Clears the memoized cache for fetchClaudeAIMcpConfigsIfEligible.
  * Call this after login so the next fetch will use the new auth tokens.
  */
 export function clearClaudeAIMcpConfigsCache(): void {
-  fetchClaudeAIMcpConfigsIfEligible.cache.clear?.()
+  fetchEligibleClaudeAIMcpConfigs.cache.clear?.()
   // Also clear the auth cache so freshly-authorized servers get re-connected
   clearMcpAuthCache()
 }

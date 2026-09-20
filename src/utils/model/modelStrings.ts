@@ -13,6 +13,7 @@ import {
   type ModelKey,
 } from './configs.js'
 import { type APIProvider, getAPIProvider } from './providers.js'
+import { getExecutionProviderProfile } from '../../providers/runtime.js'
 
 /**
  * Maps each model version to its provider-specific model ID string.
@@ -134,6 +135,12 @@ function initModelStrings(): void {
 }
 
 export function getModelStrings(): ModelStrings {
+  // Configured models resolve through their retained profile. Claude aliases
+  // needed by display code must neither read nor populate the legacy cache, nor
+  // trigger Bedrock discovery under an unrelated profile's credentials.
+  if (getExecutionProviderProfile()) {
+    return getBuiltinModelStrings(getAPIProvider())
+  }
   const ms = getModelStringsState()
   if (ms === null) {
     initModelStrings()
@@ -150,6 +157,7 @@ export function getModelStrings(): ModelStrings {
  * Call this before generating model options to ensure correct region strings.
  */
 export async function ensureModelStringsInitialized(): Promise<void> {
+  if (getExecutionProviderProfile()) return
   const ms = getModelStringsState()
   if (ms !== null) {
     return

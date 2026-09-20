@@ -29,6 +29,10 @@ import { getCanonicalName } from './model/model.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { getAPIProvider } from './model/providers.js'
 import { getInitialSettings } from './settings/settings.js'
+import {
+  getExecutionProviderProfile,
+  resolveProviderModel,
+} from '../providers/runtime.js'
 
 /**
  * SDK-provided betas that are allowed for API key users.
@@ -64,6 +68,9 @@ function partitionBetasByAllowlist(betas: string[]): {
 export function filterAllowedSdkBetas(
   sdkBetas: string[] | undefined,
 ): string[] | undefined {
+  if (getExecutionProviderProfile() && getAPIProvider() === 'openai') {
+    return undefined
+  }
   if (!sdkBetas || sdkBetas.length === 0) {
     return undefined
   }
@@ -90,6 +97,13 @@ export function filterAllowedSdkBetas(
 // however out of an abundance of caution, we do not enable any which are behind an experiment
 
 export function modelSupportsISP(model: string): boolean {
+  const configured = resolveProviderModel(model)
+  if (
+    configured &&
+    (!configured.model.reasoning || getAPIProvider(model) === 'openai')
+  ) {
+    return false
+  }
   const supported3P = get3PModelCapabilityOverride(
     model,
     'interleaved_thinking',
@@ -98,7 +112,7 @@ export function modelSupportsISP(model: string): boolean {
     return supported3P
   }
   const canonical = getCanonicalName(model)
-  const provider = getAPIProvider()
+  const provider = getAPIProvider(model)
   // Foundry supports interleaved thinking for all models
   if (provider === 'foundry') {
     return true
@@ -123,8 +137,11 @@ function vertexModelSupportsWebSearch(model: string): boolean {
 
 // Context management is supported on Claude 4+ models
 export function modelSupportsContextManagement(model: string): boolean {
+  if (resolveProviderModel(model) && getAPIProvider(model) === 'openai') {
+    return false
+  }
   const canonical = getCanonicalName(model)
-  const provider = getAPIProvider()
+  const provider = getAPIProvider(model)
   if (provider === 'foundry') {
     return true
   }
@@ -140,8 +157,11 @@ export function modelSupportsContextManagement(model: string): boolean {
 
 // @[MODEL LAUNCH]: Add the new model ID to this list if it supports structured outputs.
 export function modelSupportsStructuredOutputs(model: string): boolean {
+  if (resolveProviderModel(model) && getAPIProvider(model) === 'openai') {
+    return false
+  }
   const canonical = getCanonicalName(model)
-  const provider = getAPIProvider()
+  const provider = getAPIProvider(model)
   // Structured outputs only supported on firstParty and Foundry (not Bedrock/Vertex yet)
   if (provider !== 'firstParty' && provider !== 'foundry') {
     return false
@@ -158,12 +178,13 @@ export function modelSupportsStructuredOutputs(model: string): boolean {
 
 // @[MODEL LAUNCH]: Add the new model if it supports auto mode (specifically PI probes) — ask in #proj-claude-code-safety-research.
 export function modelSupportsAutoMode(model: string): boolean {
+  if (resolveProviderModel(model)) return false
   if (feature('TRANSCRIPT_CLASSIFIER')) {
     const m = getCanonicalName(model)
     // External: firstParty-only at launch (PI probes not wired for
     // Bedrock/Vertex/Foundry yet). Checked before allowModels so the GB
     // override can't enable auto mode on unsupported providers.
-    if (process.env.USER_TYPE !== 'ant' && getAPIProvider() !== 'firstParty') {
+    if (getAPIProvider(model) !== 'firstParty') {
       return false
     }
     // GrowthBook override: tengu_auto_mode_config.allowModels force-enables
@@ -212,7 +233,8 @@ export function getToolSearchBetaHeader(): string {
  * These are betas that are only available on firstParty provider
  * and may not be supported by proxies or other providers.
  */
-export function shouldIncludeFirstPartyOnlyBetas(): boolean {
+export function shouldIncludeFirstPartyOnlyBetas(model?: string): boolean {
+  if (resolveProviderModel(model)) return false
   return (
     (getAPIProvider() === 'firstParty' || getAPIProvider() === 'foundry') &&
     !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)
@@ -224,7 +246,8 @@ export function shouldIncludeFirstPartyOnlyBetas(): boolean {
  * GrowthBook never bucketed Foundry users into the rollout experiment — the
  * treatment data is firstParty-only.
  */
-export function shouldUseGlobalCacheScope(): boolean {
+export function shouldUseGlobalCacheScope(model?: string): boolean {
+  if (resolveProviderModel(model)) return false
   return (
     getAPIProvider() === 'firstParty' &&
     !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)
@@ -232,10 +255,13 @@ export function shouldUseGlobalCacheScope(): boolean {
 }
 
 export const getAllModelBetas = memoize((model: string): string[] => {
+  if (resolveProviderModel(model) && getAPIProvider(model) === 'openai') {
+    return []
+  }
   const betaHeaders = []
   const isHaiku = getCanonicalName(model).includes('haiku')
-  const provider = getAPIProvider()
-  const includeFirstPartyOnlyBetas = shouldIncludeFirstPartyOnlyBetas()
+  const provider = getAPIProvider(model)
+  const includeFirstPartyOnlyBetas = shouldIncludeFirstPartyOnlyBetas(model)
 
   if (!isHaiku) {
     betaHeaders.push(CLAUDE_CODE_20250219_BETA_HEADER)
@@ -248,7 +274,7 @@ export const getAllModelBetas = memoize((model: string): string[] => {
       }
     }
   }
-  if (isClaudeAISubscriber()) {
+  if (!resolveProviderModel(model) && isClaudeAISubscriber()) {
     betaHeaders.push(OAUTH_BETA_HEADER)
   }
   if (has1mContext(model)) {
@@ -305,7 +331,7 @@ export const getAllModelBetas = memoize((model: string): string[] => {
   const thinkingPreservationEnabled = modelSupportsContextManagement(model)
 
   if (
-    shouldIncludeFirstPartyOnlyBetas() &&
+    includeFirstPartyOnlyBetas &&
     (antOptedIntoToolClearing || thinkingPreservationEnabled)
   ) {
     betaHeaders.push(CONTEXT_MANAGEMENT_BETA_HEADER)
@@ -370,7 +396,7 @@ export const getAllModelBetas = memoize((model: string): string[] => {
 
 export const getModelBetas = memoize((model: string): string[] => {
   const modelBetas = getAllModelBetas(model)
-  if (getAPIProvider() === 'bedrock') {
+  if (getAPIProvider(model) === 'bedrock') {
     return modelBetas.filter(b => !BEDROCK_EXTRA_PARAMS_HEADERS.has(b))
   }
   return modelBetas
@@ -398,6 +424,9 @@ export function getMergedBetas(
   model: string,
   options?: { isAgenticQuery?: boolean },
 ): string[] {
+  if (resolveProviderModel(model) && getAPIProvider(model) === 'openai') {
+    return []
+  }
   const baseBetas = [...getModelBetas(model)]
 
   // Agentic queries always need claude-code and cli-internal beta headers.

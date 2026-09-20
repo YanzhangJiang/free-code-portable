@@ -10,6 +10,7 @@ import {
   updateSettingsForSource,
 } from '../../utils/settings/settings.js'
 import { isVoiceModeEnabled } from '../../voice/voiceModeEnabled.js'
+import { getExternalServices, resolveExternalServiceCredentials } from '../../services/external/runtime.js'
 
 const LANG_HINT_MAX_SHOWS = 2
 
@@ -22,7 +23,7 @@ export const call: LocalCommandCall = async () => {
       return {
         type: 'text' as const,
         value:
-          'Voice mode requires a Claude.ai account. Please run /login to sign in.',
+          'Configure voice in services.json, or run /login to use Claude.ai voice.',
       }
     }
     return {
@@ -55,6 +56,14 @@ export const call: LocalCommandCall = async () => {
   }
 
   // Toggle ON — run pre-flight checks first
+  const configuredVoice = getExternalServices().configuration.voice
+  if (configuredVoice) {
+    try {
+      resolveExternalServiceCredentials(configuredVoice)
+    } catch (error) {
+      return { type: 'text' as const, value: error instanceof Error ? error.message : 'Voice credentials are unavailable.' }
+    }
+  }
   const { isVoiceStreamAvailable } = await import(
     '../../services/voiceStreamSTT.js'
   )
@@ -75,7 +84,7 @@ export const call: LocalCommandCall = async () => {
     return {
       type: 'text' as const,
       value:
-        'Voice mode requires a Claude.ai account. Please run /login to sign in.',
+        'Configure voice in services.json, or run /login to use Claude.ai voice.',
     }
   }
 
@@ -123,7 +132,7 @@ export const call: LocalCommandCall = async () => {
   settingsChangeDetector.notifyChange('userSettings')
   logEvent('tengu_voice_toggled', { enabled: true })
   const key = getShortcutDisplay('voice:pushToTalk', 'Chat', 'Space')
-  const stt = normalizeLanguageForSTT(currentSettings.language)
+  const stt = normalizeLanguageForSTT(configuredVoice?.language ?? currentSettings.language, Boolean(configuredVoice))
   const cfg = getGlobalConfig()
   // Reset the hint counter whenever the resolved STT language changes
   // (including first-ever enable, where lastLanguage is undefined).
@@ -145,6 +154,6 @@ export const call: LocalCommandCall = async () => {
   }
   return {
     type: 'text' as const,
-    value: `Voice mode enabled. Hold ${key} to record.${langNote}`,
+    value: `Voice mode enabled. Hold ${key} to record.${configuredVoice ? ' Transcription starts when you release the key.' : ''}${langNote}`,
   }
 }

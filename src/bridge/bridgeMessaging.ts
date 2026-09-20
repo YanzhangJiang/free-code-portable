@@ -221,6 +221,7 @@ export type ServerControlRequestHandlers = {
    */
   outboundOnly?: boolean
   onInterrupt?: () => void
+  /** Synchronous validation failures may throw; they produce an error response. */
   onSetModel?: (model: string | undefined) => void
   onSetMaxThinkingTokens?: (maxTokens: number | null) => void
   onSetPermissionMode?: (
@@ -304,13 +305,29 @@ export function handleServerControlRequest(
       break
 
     case 'set_model':
-      onSetModel?.(request.request.model)
-      response = {
-        type: 'control_response',
-        response: {
-          subtype: 'success',
-          request_id: request.request_id,
-        },
+      try {
+        if (!onSetModel) {
+          throw new Error('set_model is not supported in this context (onSetModel callback not registered)')
+        }
+        onSetModel(request.request.model)
+        response = {
+          type: 'control_response',
+          response: {
+            subtype: 'success',
+            request_id: request.request_id,
+          },
+        }
+      } catch (error) {
+        // A rejected selection must still acknowledge the control request;
+        // otherwise remote clients wait until the bridge connection times out.
+        response = {
+          type: 'control_response',
+          response: {
+            subtype: 'error',
+            request_id: request.request_id,
+            error: errorMessage(error),
+          },
+        }
       }
       break
 

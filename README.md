@@ -1,358 +1,176 @@
-<p align="center">
-  <img src="assets/screenshot.png" alt="free-code" width="720" />
-</p>
+# Free Code Portable
 
-<h1 align="center">free-code</h1>
+**A terminal coding agent with configurable model providers and independent tool services.**
 
-<p align="center">
-  <strong>The free build of Claude Code.</strong><br>
-  All telemetry stripped. All guardrails removed. All experimental features unlocked.<br>
-  One binary, zero callbacks home.
-</p>
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-<p align="center">
-  <a href="#quick-install"><img src="https://img.shields.io/badge/install-one--liner-blue?style=flat-square" alt="Install" /></a>
-  <a href="https://github.com/paoloanzn/free-code/stargazers"><img src="https://img.shields.io/github/stars/paoloanzn/free-code?style=flat-square" alt="Stars" /></a>
-  <a href="https://github.com/paoloanzn/free-code/issues"><img src="https://img.shields.io/github/issues/paoloanzn/free-code?style=flat-square" alt="Issues" /></a>
-  <a href="https://github.com/paoloanzn/free-code/blob/main/FEATURES.md"><img src="https://img.shields.io/badge/features-88%20flags-orange?style=flat-square" alt="Feature Flags" /></a>
-  <a href="#ipfs-mirror"><img src="https://img.shields.io/badge/IPFS-mirrored-teal?style=flat-square" alt="IPFS" /></a>
-</p>
+Free Code Portable is a development fork of [freecodexyz/free-code](https://github.com/freecodexyz/free-code), based on upstream commit [`6b25ab6`](https://github.com/freecodexyz/free-code/commit/6b25ab6). It keeps the existing terminal workflow while making model selection, web search, transcription, and local browser sessions configurable independently.
 
----
+Use a local model for the main conversation, send a review to another configured provider, and keep the same tools and permission checks. Local and third-party API profiles can run without an Anthropic account. Each selected service still has its own availability, authentication, and billing requirements.
 
-## Quick Install
+This is an evolving adaptation of the inherited harness. Its core message representation still uses substantial Anthropic Messages/Beta structure, and some snapshot features remain incomplete.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/paoloanzn/free-code/main/install.sh | bash
+## What this fork adds
+
+| Area | Behavior |
+| --- | --- |
+| Model providers | Named profiles for Anthropic Messages, OpenAI Chat Completions, and Responses; existing Codex OAuth and Claude cloud integrations remain available. |
+| Model switching | `/provider` and `/model provider/model`; running requests and background agents retain their original provider context. |
+| Sub-agents | Select a different configured provider/model for an Agent or teammate, with separate credentials and the existing permission rules. |
+| Context management | Model-sized output reserves, compaction budgets, and prompts based on declared capabilities. |
+| Conversation state | Retain compatible native reasoning state for continuation and session resume; private state is scoped to its source. |
+| Web tools | SearXNG or Brave Search; direct HTTP page retrieval and local Markdown extraction. |
+| Voice | Independent OpenAI-compatible transcription, including local Whisper-compatible services. |
+| Local workflows | Local tool discovery, browser sessions, planning, and Agent-based advisor review. |
+
+## Quick start
+
+Requires **Bun 1.3.11 or newer** and macOS or Linux; use WSL on Windows. Model, search, and transcription servers are separate services: this repository does not install or start them.
+
+```sh
+git clone https://github.com/YanzhangJiang/free-code-portable.git
+cd free-code-portable
+bun install
+bun run build
 ```
 
-Checks your system, installs Bun if needed, clones the repo, builds with all experimental features enabled, and symlinks `free-code` on your PATH.
+For a local OpenAI-compatible model server already listening at `http://localhost:11434/v1`, create a separate demonstration configuration:
 
-Then run `free-code` and use the `/login` command to authenticate with your preferred model provider.
-
----
-
-## Table of Contents
-
-- [What is this](#what-is-this)
-- [Model Providers](#model-providers)
-- [Quick Install](#quick-install)
-- [Requirements](#requirements)
-- [Build](#build)
-- [Usage](#usage)
-- [Experimental Features](#experimental-features)
-- [Project Structure](#project-structure)
-- [Tech Stack](#tech-stack)
-- [IPFS Mirror](#ipfs-mirror)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## What is this
-
-A clean, buildable fork of Anthropic's [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI -- the terminal-native AI coding agent. The upstream source became publicly available on March 31, 2026 through a source map exposure in the npm distribution.
-
-This fork applies three categories of changes on top of that snapshot:
-
-### Telemetry removed
-
-The upstream binary phones home through OpenTelemetry/gRPC, GrowthBook analytics, Sentry error reporting, and custom event logging. In this build:
-
-- All outbound telemetry endpoints are dead-code-eliminated or stubbed
-- GrowthBook feature flag evaluation still works locally (needed for runtime feature gates) but does not report back
-- No crash reports, no usage analytics, no session fingerprinting
-
-### Security-prompt guardrails removed
-
-Anthropic injects system-level instructions into every conversation that constrain Claude's behavior beyond what the model itself enforces. These include hardcoded refusal patterns, injected "cyber risk" instruction blocks, and managed-settings security overlays pushed from Anthropic's servers.
-
-This build strips those injections. The model's own safety training still applies -- this just removes the extra layer of prompt-level restrictions that the CLI wraps around it.
-
-### Experimental features unlocked
-
-Claude Code ships with 88 feature flags gated behind `bun:bundle` compile-time switches. Most are disabled in the public npm release. This build unlocks all 54 flags that compile cleanly. See [Experimental Features](#experimental-features) below, or refer to [FEATURES.md](FEATURES.md) for the full audit.
-
----
-
-## Model Providers
-
-free-code supports **five API providers** out of the box. Set the corresponding environment variable to switch providers -- no code changes needed.
-
-### Anthropic (Direct API) -- Default
-
-Use Anthropic's first-party API directly.
-
-| Model | ID |
-|---|---|
-| Claude Opus 4.6 | `claude-opus-4-6` |
-| Claude Sonnet 4.6 | `claude-sonnet-4-6` |
-| Claude Haiku 4.5 | `claude-haiku-4-5` |
-
-### OpenAI Codex
-
-Use OpenAI's Codex models for code generation. Requires a Codex subscription.
-
-| Model | ID |
-|---|---|
-| GPT-5.3 Codex (recommended) | `gpt-5.3-codex` |
-| GPT-5.4 | `gpt-5.4` |
-| GPT-5.4 Mini | `gpt-5.4-mini` |
-
-```bash
-export CLAUDE_CODE_USE_OPENAI=1
-free-code
+```sh
+portable_config="$(mktemp -d "${TMPDIR:-/tmp}/free-code-portable.XXXXXX")"
+export CLAUDE_CONFIG_DIR="$portable_config"
+cp examples/providers.local.json "$portable_config/providers.json"
 ```
 
-### AWS Bedrock
+Edit the copied file, replacing both occurrences of `YOUR_MODEL_ID` with the exact model ID offered by your server. The minimal configuration is:
 
-Route requests through your AWS account via Amazon Bedrock.
-
-```bash
-export CLAUDE_CODE_USE_BEDROCK=1
-export AWS_REGION="us-east-1"   # or AWS_DEFAULT_REGION
-free-code
+```json
+{
+  "defaultProvider": "local",
+  "providers": {
+    "local": {
+      "api": "openai-completions",
+      "baseURL": "http://localhost:11434/v1",
+      "defaultModel": "YOUR_MODEL_ID",
+      "models": [
+        {
+          "id": "YOUR_MODEL_ID",
+          "contextWindow": 16384,
+          "maxOutputTokens": 4096
+        }
+      ]
+    }
+  }
+}
 ```
 
-Uses your standard AWS credentials (environment variables, `~/.aws/config`, or IAM role). Models are mapped to Bedrock ARN format automatically (e.g., `us.anthropic.claude-opus-4-6-v1`).
+Adjust the context and output limits to match your server. The model must support tool calling. A keyless local endpoint can omit `apiKeyEnv`; authenticated endpoints should name their own credential environment variable.
 
-| Variable | Purpose |
-|---|---|
-| `CLAUDE_CODE_USE_BEDROCK` | Enable Bedrock provider |
-| `AWS_REGION` / `AWS_DEFAULT_REGION` | AWS region (default: `us-east-1`) |
-| `ANTHROPIC_BEDROCK_BASE_URL` | Custom Bedrock endpoint |
-| `AWS_BEARER_TOKEN_BEDROCK` | Bearer token auth |
-| `CLAUDE_CODE_SKIP_BEDROCK_AUTH` | Skip auth (testing) |
-
-### Google Cloud Vertex AI
-
-Route requests through your GCP project via Vertex AI.
-
-```bash
-export CLAUDE_CODE_USE_VERTEX=1
-free-code
+```sh
+./cli --providers-file "$portable_config/providers.json" --provider local
+# Or send one prompt:
+./cli --providers-file "$portable_config/providers.json" --provider local \
+  -p "Read this repository and explain its structure."
 ```
 
-Uses Google Cloud Application Default Credentials (`gcloud auth application-default login`). Models are mapped to Vertex format automatically (e.g., `claude-opus-4-6@latest`).
+The temporary `CLAUDE_CONFIG_DIR` keeps this demonstration separate from an existing `~/.claude` directory. For continued use, choose a persistent configuration directory and set `CLAUDE_CONFIG_DIR` there. The exported value applies to this shell; use `unset CLAUDE_CONFIG_DIR` to return to the default location.
 
-### Anthropic Foundry
+See [PROVIDERS.md](PROVIDERS.md) for hosted APIs, credentials, multiple profiles, model capabilities, caching, and cloud integrations.
 
-Use Anthropic Foundry for dedicated deployments.
+## Switch models and delegate work
 
-```bash
-export CLAUDE_CODE_USE_FOUNDRY=1
-export ANTHROPIC_FOUNDRY_API_KEY="..."
-free-code
+Inside a session:
+
+```text
+/provider
+/provider local
+/model other-profile/exact-model-id
+/provider legacy
 ```
 
-Supports custom deployment IDs as model names.
+The selected profile and model must already exist in the loaded configuration. Changes to configuration or credential variables require a restart. Switching preserves compatible conversation history; subsequent requests send that history to the newly selected service.
 
-### Provider Selection Summary
+Agents can use a configured `provider/model` independently of the main conversation. Existing aliases such as `haiku` resolve within the parent provider, and in-flight work retains its original routing. See [sub-agent configuration and limits](PROVIDERS.md#子-agent-与长任务).
 
-| Provider | Env Variable | Auth Method |
-|---|---|---|
-| Anthropic (default) | -- | `ANTHROPIC_API_KEY` or OAuth |
-| OpenAI Codex | `CLAUDE_CODE_USE_OPENAI=1` | OAuth via OpenAI |
-| AWS Bedrock | `CLAUDE_CODE_USE_BEDROCK=1` | AWS credentials |
-| Google Vertex AI | `CLAUDE_CODE_USE_VERTEX=1` | `gcloud` ADC |
-| Anthropic Foundry | `CLAUDE_CODE_USE_FOUNDRY=1` | `ANTHROPIC_FOUNDRY_API_KEY` |
+`/advisor provider/model` selects a review model for custom profiles. Reviews use the ordinary Agent tool, subject to its permissions and the main model's decision to request a review.
 
----
+## Configure independent services
 
-## Requirements
+Search and voice use `services.json`, separate from model profiles and their credentials. To use a SearXNG instance already running on port 8888:
 
-- **Runtime**: [Bun](https://bun.sh) >= 1.3.11
-- **OS**: macOS or Linux (Windows via WSL)
-- **Auth**: An API key or OAuth login for your chosen provider
-
-```bash
-# Install Bun if you don't have it
-curl -fsSL https://bun.sh/install | bash
+```sh
+cp examples/services.searxng.json "$portable_config/services.json"
+./cli --providers-file "$portable_config/providers.json" \
+  --services-file "$portable_config/services.json" --provider local
 ```
 
----
+The example contains:
 
-## Build
-
-```bash
-git clone https://github.com/paoloanzn/free-code.git
-cd free-code
-bun build
-./cli
+```json
+{
+  "webSearch": {
+    "provider": "searxng",
+    "baseURL": "http://127.0.0.1:8888",
+    "maxResults": 10,
+    "timeoutMs": 20000
+  }
+}
 ```
 
-### Build Variants
+Enable JSON output in your SearXNG instance. Brave Search is also supported. Custom model profiles require a configured search service; search failures do not fall back to Anthropic.
 
-| Command | Output | Features | Description |
-|---|---|---|---|
-| `bun run build` | `./cli` | `VOICE_MODE` only | Production-like binary |
-| `bun run build:dev` | `./cli-dev` | `VOICE_MODE` only | Dev version stamp |
-| `bun run build:dev:full` | `./cli-dev` | All 54 experimental flags | Full unlock build |
-| `bun run compile` | `./dist/cli` | `VOICE_MODE` only | Alternative output path |
+Custom profiles fetch public web pages directly by default. Voice can use a separate Whisper-compatible endpoint and uploads audio after the push-to-talk key is released; it does not provide live interim captions. Both retain their existing tool or microphone requirements.
 
-### Custom Feature Flags
+See [EXTERNAL_SERVICES.md](EXTERNAL_SERVICES.md) for complete examples, proxy support, fetch restrictions, and transcription requirements.
 
-Enable specific flags without the full bundle:
+## Local browser sessions and planning
 
-```bash
-# Enable just ultraplan and ultrathink
-bun run ./scripts/build.ts --feature=ULTRAPLAN --feature=ULTRATHINK
-
-# Add a flag on top of the dev build
-bun run ./scripts/build.ts --dev --feature=BRIDGE_MODE
+```sh
+./cli local-remote --port 8080 --cwd "$PWD" -- \
+  --providers-file "$portable_config/providers.json" --provider local
 ```
 
----
+Open the printed local URL and enter the access token shown in the terminal. The browser can send prompts, view events, approve tools, and cancel work in a new persistent CLI child session. It binds to `127.0.0.1`; use an SSH tunnel for another machine. It does not attach to an existing terminal session. Stopping the server ends its child session.
 
-## Usage
+`/plan` uses the current local session. With a custom profile, `/ultraplan <request>` also plans locally with available exploration/planning agents and ordinary plan approval. These paths need no Anthropic hosted relay; normal model requests still go to the selected provider.
 
-```bash
-# Interactive REPL (default)
-./cli
+## Compatibility and current limits
 
-# One-shot mode
-./cli -p "what files are in this directory?"
+- Provider support is protocol-specific. Bedrock, Vertex, and Foundry use the inherited Claude integrations; native Gemini and Bedrock Converse are not implemented.
+- Chat Completions/Responses adapters support text, declared image capability, and local tool calls. They do not implement PDF/document, audio/video conversation blocks, or arbitrary vendor-hosted tools.
+- Native reasoning state is replayed only for matching sources and unchanged content. It cannot be moved freely across providers, models, or endpoints, or reconstructed after it was lost.
+- Token counts may use local estimates. Declared context limits must match the server, and very large prompts or tool results can still exceed them.
+- Custom profiles use ordinary permissions and approvals. Anthropic's automatic permission classifier and Fast mode are not portable; Claude.ai connectors and cloud sync are not automatically enabled.
+- Direct web fetch has no browser login state. Transcription needs a working recording backend. Search, transcription, and hosted model services may charge separately.
+- Credential-bearing model/search profiles may require in-process teammates instead of independent terminal panes. See the detailed provider guide.
+- Experimental flags that compile are not a guarantee of a complete feature. Protocol tests do not establish equal coding quality across models; live-service compatibility and performance need separate evaluation.
 
-# Specify a model
-./cli --model claude-opus-4-6
+Existing `FREE_CODE_*` variables, `CLAUDE_CONFIG_DIR`, `~/.claude`, and CLI compatibility conventions are retained. The repository name is not a migration of existing settings. Legacy routes remain available through `/provider legacy`.
 
-# Run from source (slower startup)
-bun run dev
+## Development and documentation
 
-# OAuth login
-./cli /login
+```sh
+bun run build                         # ./cli
+bun run build:dev:full                # ./cli-dev, broader experimental flags
+FREE_CODE_TEST_NETWORK=1 FREE_CODE_TEST_BINARY="$PWD/cli-dev" bun run test:providers
+git diff --check
 ```
 
-### Environment Variables Reference
+The tests include local mock HTTP services and real CLI tool loops; they need permission to listen on loopback and do not require paid model calls. The inherited snapshot still has whole-project TypeScript diagnostics. A successful build or focused test run is not a claim that the entire source tree type-checks cleanly.
 
-| Variable | Purpose |
-|---|---|
-| `ANTHROPIC_API_KEY` | Anthropic API key |
-| `ANTHROPIC_AUTH_TOKEN` | Auth token (alternative) |
-| `ANTHROPIC_MODEL` | Override default model |
-| `ANTHROPIC_BASE_URL` | Custom API endpoint |
-| `ANTHROPIC_DEFAULT_OPUS_MODEL` | Custom Opus model ID |
-| `ANTHROPIC_DEFAULT_SONNET_MODEL` | Custom Sonnet model ID |
-| `ANTHROPIC_DEFAULT_HAIKU_MODEL` | Custom Haiku model ID |
-| `CLAUDE_CODE_OAUTH_TOKEN` | OAuth token via env |
-| `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` | API key helper cache TTL |
+| Document | Contents |
+| --- | --- |
+| [Provider guide](PROVIDERS.md) | Configuration, routing, credentials, capabilities, and detailed limits. |
+| [Independent services](EXTERNAL_SERVICES.md) | Search, web fetch, transcription, browser sessions, and local planning. |
+| [Provider evaluation](PROVIDER_EVALUATION.md) | Optional real-model task runner; explicitly enabled calls may incur charges. |
+| [Feature audit](FEATURES.md) | Inherited compile-time flags and reconstruction notes. |
+| [Development guidance](AGENTS.md) | Repository conventions, resource ownership, verification, and commit workflow. |
+| [Upstream change notes](changes.md) | Historical notes inherited from the upstream snapshot. |
 
----
+For contributions, make a focused branch, follow [AGENTS.md](AGENTS.md), describe the behavior changed, and include relevant verification. Do not commit credentials or personal configuration.
 
-## Experimental Features
+## Provenance and licensing status
 
-The `bun run build:dev:full` build enables all 54 working feature flags. Highlights:
+This repository is a fork of [freecodexyz/free-code](https://github.com/freecodexyz/free-code), which reconstructs a Claude Code source snapshot. It is an independent project, not an official Anthropic product.
 
-### Interaction & UI
-
-| Flag | Description |
-|---|---|
-| `ULTRAPLAN` | Remote multi-agent planning on Claude Code web (Opus-class) |
-| `ULTRATHINK` | Deep thinking mode -- type "ultrathink" to boost reasoning effort |
-| `VOICE_MODE` | Push-to-talk voice input and dictation |
-| `TOKEN_BUDGET` | Token budget tracking and usage warnings |
-| `HISTORY_PICKER` | Interactive prompt history picker |
-| `MESSAGE_ACTIONS` | Message action entrypoints in the UI |
-| `QUICK_SEARCH` | Prompt quick-search |
-| `SHOT_STATS` | Shot-distribution stats |
-
-### Agents, Memory & Planning
-
-| Flag | Description |
-|---|---|
-| `BUILTIN_EXPLORE_PLAN_AGENTS` | Built-in explore/plan agent presets |
-| `VERIFICATION_AGENT` | Verification agent for task validation |
-| `AGENT_TRIGGERS` | Local cron/trigger tools for background automation |
-| `AGENT_TRIGGERS_REMOTE` | Remote trigger tool path |
-| `EXTRACT_MEMORIES` | Post-query automatic memory extraction |
-| `COMPACTION_REMINDERS` | Smart reminders around context compaction |
-| `CACHED_MICROCOMPACT` | Cached microcompact state through query flows |
-| `TEAMMEM` | Team-memory files and watcher hooks |
-
-### Tools & Infrastructure
-
-| Flag | Description |
-|---|---|
-| `BRIDGE_MODE` | IDE remote-control bridge (VS Code, JetBrains) |
-| `BASH_CLASSIFIER` | Classifier-assisted bash permission decisions |
-| `PROMPT_CACHE_BREAK_DETECTION` | Cache-break detection in compaction/query flow |
-
-See [FEATURES.md](FEATURES.md) for the complete audit of all 88 flags, including 34 broken flags with reconstruction notes.
-
----
-
-## Project Structure
-
-```
-scripts/
-  build.ts                # Build script with feature flag system
-
-src/
-  entrypoints/cli.tsx     # CLI entrypoint
-  commands.ts             # Command registry (slash commands)
-  tools.ts                # Tool registry (agent tools)
-  QueryEngine.ts          # LLM query engine
-  screens/REPL.tsx        # Main interactive UI (Ink/React)
-
-  commands/               # /slash command implementations
-  tools/                  # Agent tool implementations (Bash, Read, Edit, etc.)
-  components/             # Ink/React terminal UI components
-  hooks/                  # React hooks
-  services/               # API clients, MCP, OAuth, analytics
-    api/                  # API client + Codex fetch adapter
-    oauth/                # OAuth flows (Anthropic + OpenAI)
-  state/                  # App state store
-  utils/                  # Utilities
-    model/                # Model configs, providers, validation
-  skills/                 # Skill system
-  plugins/                # Plugin system
-  bridge/                 # IDE bridge
-  voice/                  # Voice input
-  tasks/                  # Background task management
-```
-
----
-
-## Tech Stack
-
-| | |
-|---|---|
-| **Runtime** | [Bun](https://bun.sh) |
-| **Language** | TypeScript |
-| **Terminal UI** | React + [Ink](https://github.com/vadimdemedes/ink) |
-| **CLI Parsing** | [Commander.js](https://github.com/tj/commander.js) |
-| **Schema Validation** | Zod v4 |
-| **Code Search** | ripgrep (bundled) |
-| **Protocols** | MCP, LSP |
-| **APIs** | Anthropic Messages, OpenAI Codex, AWS Bedrock, Google Vertex AI |
-
----
-
-## IPFS Mirror
-
-A full copy of this repository is permanently pinned on IPFS via Filecoin:
-
-| | |
-|---|---|
-| **CID** | `bafybeiegvef3dt24n2znnnmzcud2vxat7y7rl5ikz7y7yoglxappim54bm` |
-| **Gateway** | https://w3s.link/ipfs/bafybeiegvef3dt24n2znnnmzcud2vxat7y7rl5ikz7y7yoglxappim54bm |
-
-If this repo gets taken down, the code lives on.
-
----
-
-## Contributing
-
-Contributions are welcome. If you're working on restoring one of the 34 broken feature flags, check the reconstruction notes in [FEATURES.md](FEATURES.md) first -- many are close to compiling and just need a small wrapper or missing asset.
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feat/my-feature`)
-3. Commit your changes (`git commit -m 'feat: add something'`)
-4. Push to the branch (`git push origin feat/my-feature`)
-5. Open a Pull Request
-
----
-
-## License
-
-The original Claude Code source is the property of Anthropic. This fork exists because the source was publicly exposed through their npm distribution. Use at your own discretion.
+The inherited README identifies the original Claude Code source as Anthropic's property. This repository currently has no repository-wide `LICENSE` file, and this fork does not assert a new blanket license over the inherited source. Dependencies retain their respective notices and terms.

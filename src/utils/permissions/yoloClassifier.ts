@@ -29,6 +29,7 @@ import { lazySchema } from '../lazySchema.js'
 import { extractTextContent } from '../messages.js'
 import { resolveAntModel } from '../model/antModels.js'
 import { getMainLoopModel } from '../model/model.js'
+import { modelSupportsAutoMode } from '../betas.js'
 import { getAutoModeConfig } from '../settings/settings.js'
 import { sideQuery } from '../sideQuery.js'
 import { jsonStringify } from '../slowOperations.js'
@@ -1015,7 +1016,17 @@ export async function classifyYoloAction(
   tools: Tools,
   context: ToolPermissionContext,
   signal: AbortSignal,
+  executionModel: string = getMainLoopModel(),
 ): Promise<YoloClassifierResult> {
+  // Direct callers (including subagent handoff) must not revive a stale auto
+  // setting after provider changes, even for actions declared irrelevant.
+  if (!modelSupportsAutoMode(executionModel)) {
+    return { shouldBlock: true, unavailable: true, model: executionModel, reason: 'Auto approval is unavailable for this model. Normal permission approval is required.' }
+  }
+  const model = getClassifierModel()
+  if (!modelSupportsAutoMode(model)) {
+    return { shouldBlock: true, unavailable: true, model, reason: 'The configured safety classifier is unavailable. Normal permission approval is required.' }
+  }
   const lookup = buildToolLookup(tools)
   const actionCompact = toCompact(action, lookup)
   // '' = "no security relevance" (Tool.toAutoClassifierInput contract). Without
@@ -1024,7 +1035,7 @@ export async function classifyYoloAction(
     return {
       shouldBlock: false,
       reason: 'Tool declares no classifier-relevant input',
-      model: getClassifierModel(),
+      model,
     }
   }
 
@@ -1104,8 +1115,6 @@ export async function classifyYoloAction(
     text: actionCompact,
     cache_control: cacheControl,
   })
-
-  const model = getClassifierModel()
 
   // Dispatch to 2-stage XML classifier if enabled via GrowthBook
   if (isTwoStageClassifierEnabled()) {

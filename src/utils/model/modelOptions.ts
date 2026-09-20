@@ -33,6 +33,12 @@ import {
 } from './model.js'
 import { has1mContext } from '../context.js'
 import { getGlobalConfig } from '../config.js'
+import {
+  getActiveProviderProfile,
+  getProviderProfiles,
+  getQualifiedModelId,
+  resolveProviderModel,
+} from '../../providers/runtime.js'
 
 // @[MODEL LAUNCH]: Update all the available and default model option strings below.
 
@@ -44,6 +50,14 @@ export type ModelOption = {
 }
 
 export function getDefaultOptionForUser(fastMode = false): ModelOption {
+  const configured = resolveProviderModel()
+  if (configured) {
+    return {
+      value: null,
+      label: 'Default (recommended)',
+      description: `${configured.profile.name ?? configured.profile.id} · ${configured.model.name ?? configured.model.id}`,
+    }
+  }
   if (process.env.USER_TYPE === 'ant') {
     const currentModel = renderDefaultModelSetting(
       getDefaultMainLoopModelSetting(),
@@ -498,7 +512,20 @@ function getKnownModelOption(model: string): ModelOption | null {
 }
 
 export function getModelOptions(fastMode = false): ModelOption[] {
-  const options = getModelOptionsBase(fastMode)
+  const profileOptions: ModelOption[] = getProviderProfiles().flatMap(profile =>
+    profile.models.map(model => ({
+      value: getQualifiedModelId(profile.id, model.id),
+      label: `${model.name ?? model.id} (${profile.name ?? profile.id})`,
+      description: `${model.contextWindow.toLocaleString()} context · ${model.maxOutputTokens.toLocaleString()} max output · ${model.cost ? `$${model.cost.input}/$${model.cost.output} per Mtok` : 'Pricing unknown'}`,
+    })),
+  )
+  if (getActiveProviderProfile()) {
+    return filterModelOptionsByAllowlist([
+      getDefaultOptionForUser(),
+      ...profileOptions,
+    ])
+  }
+  const options = [...getModelOptionsBase(fastMode), ...profileOptions]
 
   // Add the custom model from the ANTHROPIC_CUSTOM_MODEL_OPTION env var
   const envCustomModel = process.env.ANTHROPIC_CUSTOM_MODEL_OPTION

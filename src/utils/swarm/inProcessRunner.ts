@@ -1,3 +1,5 @@
+import { createProviderExecutionContext } from '../../providers/runtime.js'
+import { runWithProviderExecutionContext } from '../../providers/execution-context.js'
 /**
  * In-process teammate runner
  *
@@ -73,7 +75,6 @@ import {
   SUBAGENT_REJECT_MESSAGE,
   SUBAGENT_REJECT_MESSAGE_WITH_REASON_PREFIX,
 } from '../messages.js'
-import type { ModelAlias } from '../model/aliases.js'
 import {
   applyPermissionUpdates,
   persistPermissionUpdates,
@@ -880,7 +881,16 @@ async function waitForNextPromptOrShutdown(
  * @param config - Runner configuration
  * @returns Result with messages and success status
  */
-export async function runInProcessTeammate(
+export function runInProcessTeammate(
+  config: InProcessRunnerConfig,
+): Promise<InProcessRunnerResult> {
+  return runWithProviderExecutionContext(
+    createProviderExecutionContext(config.model ?? config.toolUseContext.options.mainLoopModel),
+    () => runInProcessTeammateInProviderContext(config),
+  )
+}
+
+async function runInProcessTeammateInProviderContext(
   config: InProcessRunnerConfig,
 ): Promise<InProcessRunnerResult> {
   const {
@@ -1195,7 +1205,7 @@ export async function runInProcessTeammate(
             forkContextMessages,
             querySource: 'agent:custom',
             override: { abortController: currentWorkAbortController },
-            model: model as ModelAlias | undefined,
+            model,
             preserveToolUseResults: true,
             availableTools: toolUseContext.options.tools,
             allowedTools,

@@ -103,6 +103,8 @@ import { buildQueryConfig } from './query/config.js'
 import { productionDeps, type QueryDeps } from './query/deps.js'
 import type { Terminal, Continue } from './query/transitions.js'
 import { feature } from 'bun:bundle'
+import { createProviderExecutionContext } from './providers/runtime.js'
+import { bindProviderExecutionContext } from './providers/execution-context.js'
 import {
   getCurrentTurnTokenBudget,
   getTurnOutputTokens,
@@ -216,7 +218,12 @@ type State = {
   transition: Continue | undefined
 }
 
-export async function* query(
+export function query(params: QueryParams): ReturnType<typeof queryInProviderContext> {
+  const context = createProviderExecutionContext(params.toolUseContext.options.mainLoopModel)
+  return bindProviderExecutionContext(context, () => queryInProviderContext(params))
+}
+
+async function* queryInProviderContext(
   params: QueryParams,
 ): AsyncGenerator<
   | StreamEvent

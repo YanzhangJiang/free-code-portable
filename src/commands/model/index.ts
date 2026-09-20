@@ -1,4 +1,5 @@
 import type { Command } from '../../commands.js'
+import { getProviderProfiles } from '../../providers/runtime.js'
 import { shouldInferenceConfigCommandBeImmediate } from '../../utils/immediateCommand.js'
 import { getMainLoopModel, renderModelName } from '../../utils/model/model.js'
 
@@ -10,7 +11,7 @@ export default {
   },
   argumentHint: '[model]',
   get immediate() {
-    return shouldInferenceConfigCommandBeImmediate()
+    return getProviderProfiles().length === 0 && shouldInferenceConfigCommandBeImmediate()
   },
   load: () => import('./model.js'),
 } satisfies Command

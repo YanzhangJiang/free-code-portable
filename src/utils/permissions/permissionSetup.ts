@@ -728,7 +728,10 @@ export function initialPermissionModeFromCLI({
   if (permissionModeCli) {
     const parsedMode = permissionModeFromString(permissionModeCli)
     if (feature('TRANSCRIPT_CLASSIFIER') && parsedMode === 'auto') {
-      if (autoModeCircuitBrokenSync) {
+      if (!modelSupportsAutoMode(getMainLoopModel())) {
+        notification = 'Auto approval is unavailable for this model; using normal permission prompts.'
+        orderedModes.push('default')
+      } else if (autoModeCircuitBrokenSync) {
         logForDebugging(
           'auto mode circuit breaker active (cached) — falling back to default',
           { level: 'warn' },
@@ -759,7 +762,10 @@ export function initialPermissionModeFromCLI({
     }
     // auto from settings requires the same gate check as from CLI
     else if (feature('TRANSCRIPT_CLASSIFIER') && settingsMode === 'auto') {
-      if (autoModeCircuitBrokenSync) {
+      if (!modelSupportsAutoMode(getMainLoopModel())) {
+        notification = 'Auto approval is unavailable for this model; using normal permission prompts.'
+        orderedModes.push('default')
+      } else if (autoModeCircuitBrokenSync) {
         logForDebugging(
           'auto mode circuit breaker active (cached) — falling back to default',
           { level: 'warn' },

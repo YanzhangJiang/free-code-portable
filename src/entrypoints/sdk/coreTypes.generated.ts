@@ -63,17 +63,17 @@ export type SDKBaseMessage = {
 export type SDKAssistantMessage = SDKBaseMessage & {
   type: 'assistant'
   message?: { content?: unknown[] }
+  error?: SDKAssistantMessageError
 }
 
-export type SDKAssistantMessageError = SDKBaseMessage & {
-  type: 'assistant_error'
-  message?: string
-}
+// This is the assistant message's error category, not a separate message type.
+// Keep the public contract identical to the installed SDK and coreSchemas.ts.
+export type SDKAssistantMessageError = import('@anthropic-ai/claude-agent-sdk').SDKAssistantMessageError
 
-export type SDKPartialAssistantMessage = SDKBaseMessage & {
-  type: 'assistant_partial'
-  delta?: string
-}
+export type SDKPartialAssistantMessage = import('@anthropic-ai/claude-agent-sdk').SDKPartialAssistantMessage
+export type SDKToolUseSummaryMessage = import('@anthropic-ai/claude-agent-sdk').SDKToolUseSummaryMessage
+export type SDKAuthStatusMessage = import('@anthropic-ai/claude-agent-sdk').SDKAuthStatusMessage
+export type SDKRateLimitEvent = import('@anthropic-ai/claude-agent-sdk').SDKRateLimitEvent
 
 export type SDKResultMessage = SDKBaseMessage & {
   type: 'result'
@@ -157,9 +157,11 @@ export type AsyncHookJSONOutput = HookJSONOutput & {
 
 export type SDKMessage =
   | SDKAssistantMessage
-  | SDKAssistantMessageError
   | SDKCompactBoundaryMessage
   | SDKPartialAssistantMessage
+  | SDKToolUseSummaryMessage
+  | SDKAuthStatusMessage
+  | SDKRateLimitEvent
   | SDKPermissionDenial
   | SDKResultMessage
   | SDKStatusMessage

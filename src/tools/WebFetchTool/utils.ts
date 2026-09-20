@@ -16,6 +16,8 @@ import { getSettings_DEPRECATED } from '../../utils/settings/settings.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 import { isPreapprovedHost } from './preapproved.js'
 import { makeSecondaryModelPrompt } from './prompt.js'
+import { isPermittedRedirect } from './redirect.js'
+export { isPermittedRedirect } from './redirect.js'
 
 // Custom error classes for domain blocking
 class DomainBlockedError extends Error {
@@ -199,46 +201,6 @@ export async function checkDomainBlocklist(
   } catch (e) {
     logError(e)
     return { status: 'check_failed', error: e as Error }
-  }
-}
-
-/**
- * Check if a redirect is safe to follow
- * Allows redirects that:
- * - Add or remove "www." in the hostname
- * - Keep the origin the same but change path/query params
- * - Or both of the above
- */
-export function isPermittedRedirect(
-  originalUrl: string,
-  redirectUrl: string,
-): boolean {
-  try {
-    const parsedOriginal = new URL(originalUrl)
-    const parsedRedirect = new URL(redirectUrl)
-
-    if (parsedRedirect.protocol !== parsedOriginal.protocol) {
-      return false
-    }
-
-    if (parsedRedirect.port !== parsedOriginal.port) {
-      return false
-    }
-
-    if (parsedRedirect.username || parsedRedirect.password) {
-      return false
-    }
-
-    // Now check hostname conditions
-    // 1. Adding www. is allowed: example.com -> www.example.com
-    // 2. Removing www. is allowed: www.example.com -> example.com
-    // 3. Same host (with or without www.) is allowed: paths can change
-    const stripWww = (hostname: string) => hostname.replace(/^www\./, '')
-    const originalHostWithoutWww = stripWww(parsedOriginal.hostname)
-    const redirectHostWithoutWww = stripWww(parsedRedirect.hostname)
-    return originalHostWithoutWww === redirectHostWithoutWww
-  } catch (_error) {
-    return false
   }
 }
 

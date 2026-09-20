@@ -1,3 +1,5 @@
+import { createProviderExecutionContext } from '../providers/runtime.js'
+import { runWithProviderExecutionContext } from '../providers/execution-context.js'
 /**
  * Helper for running forked agent query loops with usage tracking.
  *
@@ -486,7 +488,16 @@ export function createSubagentContext(
  * })
  * ```
  */
-export async function runForkedAgent({
+export function runForkedAgent(params: ForkedAgentParams): Promise<ForkedAgentResult> {
+  const model = params.overrides?.options?.mainLoopModel ??
+    params.cacheSafeParams.toolUseContext.options.mainLoopModel
+  return runWithProviderExecutionContext(
+    createProviderExecutionContext(model),
+    () => runForkedAgentInProviderContext(params),
+  )
+}
+
+async function runForkedAgentInProviderContext({
   promptMessages,
   cacheSafeParams,
   canUseTool,
@@ -597,6 +608,10 @@ export async function runForkedAgent({
       }
     }
   } finally {
+    if (!overrides?.abortController && !overrides?.shareAbortController) {
+      // Completion removes the owned child's subscription to the parent signal.
+      isolatedToolUseContext.abortController.abort()
+    }
     // Release cloned file state cache memory (same pattern as runAgent.ts)
     isolatedToolUseContext.readFileState.clear()
     // Release the cloned fork context messages

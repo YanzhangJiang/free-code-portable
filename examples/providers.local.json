@@ -1,0 +1,20 @@
+{
+  "defaultProvider": "local",
+  "providers": {
+    "local": {
+      "name": "Local coding model",
+      "api": "openai-completions",
+      "baseURL": "http://localhost:11434/v1",
+      "defaultModel": "YOUR_MODEL_ID",
+      "models": [
+        {
+          "id": "YOUR_MODEL_ID",
+          "contextWindow": 16384,
+          "maxOutputTokens": 4096,
+          "vision": false,
+          "reasoning": false
+        }
+      ]
+    }
+  }
+}

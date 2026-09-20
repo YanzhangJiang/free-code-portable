@@ -11,6 +11,7 @@ import { SEND_MESSAGE_TOOL_NAME } from '../SendMessageTool/constants.js'
 import { AGENT_TOOL_NAME } from './constants.js'
 import { isForkSubagentEnabled } from './forkSubagent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
+import { getExecutionProviderProfile } from '../../providers/runtime.js'
 
 function getToolsDescription(agent: AgentDefinition): string {
   const { tools, disallowedTools } = agent
@@ -201,7 +202,7 @@ ${effectiveAgents.map(agent => formatAgentLine(agent)).join('\n')}`
   // Shared core prompt used by both coordinator and non-coordinator modes
   const shared = `Launch a new agent to handle complex, multi-step tasks autonomously.
 
-The ${AGENT_TOOL_NAME} tool launches specialized agents (subprocesses) that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
+The ${AGENT_TOOL_NAME} tool launches specialized agents that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
 
 ${agentListSection}
 
@@ -215,6 +216,27 @@ ${
   // already covers usage notes, examples, and when-not-to-use guidance.
   if (isCoordinator) {
     return shared
+  }
+
+  if (getExecutionProviderProfile()) {
+    return `${shared}
+
+Usage notes:
+- Give each agent a concrete objective, relevant context, file boundaries, and the result you need. State whether it should edit code or only investigate.
+- Delegate independent work when it helps; directly handle simple lookups. Do not duplicate work assigned to another agent.
+- Include a short description of the task. Read the returned result before relying on it and relay relevant findings to the user.
+- Tool and model choices must use the schemas and configuration available in this session. An agent on another model can have different capabilities and costs.
+- Use isolation: "worktree" for an isolated repository copy when appropriate. If the agent changes files, its result includes the worktree path and branch.
+${forkEnabled
+  ? '- Omitting subagent_type creates a fork with the current conversation context. A specialized agent starts fresh and needs a complete briefing. Inherited context does not guarantee provider-side cache reuse.\n'
+  : ''}${!isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS) && !isInProcessTeammate() && !forkEnabled
+  ? '- Use run_in_background for independent work; completion is reported through a notification. Use foreground execution when the result is needed before continuing.\n'
+  : ''}- To resume a prior agent, use ${SEND_MESSAGE_TOOL_NAME} with its ID or name. Never invent the result of an unfinished task.
+${isInProcessTeammate()
+  ? '- Only synchronous subagents are available here; run_in_background, name, team_name, and mode are unavailable.'
+  : isTeammate()
+    ? '- Teammates cannot spawn other teammates; omit name, team_name, and mode.'
+    : ''}`
   }
 
   // Ant-native builds alias find/grep to embedded bfs/ugrep and remove the

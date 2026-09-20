@@ -5,6 +5,7 @@
  * literals with process.env.USER_TYPE === 'ant' for Bun to remove the codenames
  * during dead code elimination
  */
+import { getProviderExecutionContext } from '../../providers/execution-context.js'
 import { getMainLoopModelOverride } from '../../bootstrap/state.js'
 import {
   getSubscriptionType,
@@ -13,8 +14,16 @@ import {
   isMaxSubscriber,
   isProSubscriber,
   isTeamPremiumSubscriber,
-  isCodexSubscriber,
 } from '../auth.js'
+import {
+  getExecutionProviderProfile,
+  getQualifiedModelId,
+  findQualifiedProviderModel,
+  resolveModelInProviderProfile,
+  resolveProviderModel,
+  resolveProviderCredentials,
+  resolveExplicitProviderModel,
+} from '../../providers/runtime.js'
 import { getAntModelOverrideConfig, resolveAntModel } from './antModels.js'
 import {
   has1mContext,
@@ -37,6 +46,13 @@ export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
 
 export function getSmallFastModel(): ModelName {
+  const profile = getExecutionProviderProfile()
+  if (profile) {
+    return getQualifiedModelId(
+      profile.id,
+      profile.smallModel ?? profile.defaultModel,
+    )
+  }
   return process.env.ANTHROPIC_SMALL_FAST_MODEL || getDefaultHaikuModel()
 }
 
@@ -62,11 +78,19 @@ export function isNonCustomOpusModel(model: ModelName): boolean {
  * 4. Settings (from user's saved settings)
  */
 export function getUserSpecifiedModelSetting(): ModelSetting | undefined {
+  const execution = getProviderExecutionContext()
+  if (execution) {
+    return execution.kind === 'profile' ? execution.resolved.qualifiedModel : execution.model
+  }
   let specifiedModel: ModelSetting | undefined
 
   const modelOverride = getMainLoopModelOverride()
   if (modelOverride !== undefined) {
     specifiedModel = modelOverride
+  } else if (getExecutionProviderProfile()) {
+    // A profile owns its default. Legacy saved Claude choices and ANTHROPIC_MODEL
+    // must not override it; explicit CLI and session choices use the override.
+    specifiedModel = undefined
   } else {
     const settings = getSettings_DEPRECATED() || {}
     specifiedModel = process.env.ANTHROPIC_MODEL || settings.model || undefined
@@ -106,6 +130,8 @@ export function getBestModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Opus model (3P providers may lag so keep defaults unchanged).
 export function getDefaultOpusModel(): ModelName {
+  const configured = resolveProviderModel()
+  if (configured) return configured.qualifiedModel
   if (process.env.ANTHROPIC_DEFAULT_OPUS_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
   }
@@ -120,6 +146,8 @@ export function getDefaultOpusModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Sonnet model (3P providers may lag so keep defaults unchanged).
 export function getDefaultSonnetModel(): ModelName {
+  const configured = resolveProviderModel()
+  if (configured) return configured.qualifiedModel
   if (process.env.ANTHROPIC_DEFAULT_SONNET_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
   }
@@ -132,6 +160,13 @@ export function getDefaultSonnetModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Haiku model (3P providers may lag so keep defaults unchanged).
 export function getDefaultHaikuModel(): ModelName {
+  const profile = getExecutionProviderProfile()
+  if (profile) {
+    return getQualifiedModelId(
+      profile.id,
+      profile.smallModel ?? profile.defaultModel,
+    )
+  }
   if (process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL) {
     return process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
   }
@@ -151,6 +186,8 @@ export function getRuntimeMainLoopModel(params: {
   exceeds200kTokens?: boolean
 }): ModelName {
   const { permissionMode, mainLoopModel, exceeds200kTokens = false } = params
+  const configured = resolveProviderModel(mainLoopModel)
+  if (configured) return configured.qualifiedModel
 
   // opusplan uses Opus in plan mode without [1m] suffix.
   if (
@@ -179,6 +216,8 @@ export function getRuntimeMainLoopModel(params: {
  * @returns The default model setting to use
  */
 export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
+  const configured = resolveProviderModel()
+  if (configured) return configured.qualifiedModel
   if (isCodexSubscriber()) {
     return getModelStrings().gpt53codex
   }
@@ -294,6 +333,20 @@ export function firstPartyNameToCanonical(name: ModelName): ModelShortName {
  * @returns The short name (e.g., 'claude-3-5-haiku') if found, or the original name if no mapping exists
  */
 export function getCanonicalName(fullModelName: ModelName): ModelShortName {
+  const configured = findQualifiedProviderModel(fullModelName)
+  if (configured) {
+    switch (configured.profile.api) {
+      case 'anthropic':
+      case 'bedrock':
+      case 'vertex':
+      case 'foundry':
+        return firstPartyNameToCanonical(configured.model.id)
+      case 'openai-completions':
+      case 'openai-responses':
+      case 'codex':
+        return configured.qualifiedModel
+    }
+  }
   // Resolve overridden model IDs (e.g. Bedrock ARNs) back to canonical names.
   // resolved is always a 1P-format ID, so firstPartyNameToCanonical can handle it.
   return firstPartyNameToCanonical(resolveOverriddenModel(fullModelName))
@@ -303,6 +356,10 @@ export function getCanonicalName(fullModelName: ModelName): ModelShortName {
 export function getClaudeAiUserDefaultModelDescription(
   fastMode = false,
 ): string {
+  const configured = resolveProviderModel()
+  if (configured) {
+    return `${configured.model.name ?? configured.model.id} · ${configured.profile.name ?? configured.profile.id}`
+  }
   if (isCodexSubscriber()) {
     return 'GPT-5.3 Codex · Optimized for code generation and understanding'
   }
@@ -332,6 +389,8 @@ export function getOpus46PricingSuffix(fastMode: boolean): string {
 }
 
 export function isOpus1mMergeEnabled(): boolean {
+  // Configured profiles declare their context window explicitly.
+  if (getExecutionProviderProfile()) return false
   if (
     is1mContextDisabled() ||
     isProSubscriber() ||
@@ -367,6 +426,10 @@ export function renderModelSetting(setting: ModelName | ModelAlias): string {
  * if the model is not recognized as a public model.
  */
 export function getPublicModelDisplayName(model: ModelName): string | null {
+  const configured = findQualifiedProviderModel(model)
+  if (configured) {
+    return `${configured.model.name ?? configured.model.id} (${configured.profile.name ?? configured.profile.id})`
+  }
   if (model.includes('gpt-') || model.includes('codex')) {
     if (model === 'gpt-5.2-codex') return 'Codex 5.2'
     if (model === 'gpt-5.1-codex') return 'Codex 5.1'
@@ -459,6 +522,8 @@ export function renderModelName(model: ModelName): string {
  * @returns "Claude {ModelName}" for public models, or "Claude ({model})" for non-public models
  */
 export function getPublicModelName(model: ModelName): string {
+  const configured = findQualifiedProviderModel(model)
+  if (configured) return configured.model.name ?? configured.model.id
   const publicName = getPublicModelDisplayName(model)
   if (publicName) {
     if (model.includes('gpt-') || model.includes('codex')) {
@@ -485,6 +550,10 @@ export function parseUserSpecifiedModel(
   modelInput: ModelName | ModelAlias,
 ): ModelName {
   const modelInputTrimmed = modelInput.trim()
+  // Resolve before case folding or Claude aliases: deployment IDs are case
+  // sensitive and the namespace pins every request to its selected provider.
+  const configured = resolveProviderModel(modelInputTrimmed)
+  if (configured) return configured.qualifiedModel
   const normalizedModel = modelInputTrimmed.toLowerCase()
 
   const has1mTag = has1mContext(normalizedModel)
@@ -563,6 +632,16 @@ export function resolveSkillModelOverride(
   skillModel: string,
   currentModel: string,
 ): string {
+  const parent = resolveProviderModel(currentModel)
+  const configured = resolveExplicitProviderModel(skillModel) ??
+    (parent ? resolveModelInProviderProfile(parent.profile, skillModel) : undefined)
+  if (configured) {
+    if (!isModelAllowed(configured.qualifiedModel)) {
+      throw new Error(`Model '${configured.qualifiedModel}' is not available. Your organization restricts model selection.`)
+    }
+    resolveProviderCredentials(configured.profile)
+    return configured.qualifiedModel
+  }
   if (has1mContext(skillModel) || !has1mContext(currentModel)) {
     return skillModel
   }
@@ -607,6 +686,8 @@ export function modelDisplayString(model: ModelSetting): string {
 
 // @[MODEL LAUNCH]: Add a marketing name mapping for the new model below.
 export function getMarketingNameForModel(modelId: string): string | undefined {
+  const configured = findQualifiedProviderModel(modelId)
+  if (configured) return configured.model.name ?? configured.model.id
   if (getAPIProvider() === 'foundry') {
     // deployment ID is user-defined in Foundry, so it may have no relation to the actual model
     return undefined
@@ -663,5 +744,21 @@ export function getMarketingNameForModel(modelId: string): string | undefined {
 }
 
 export function normalizeModelStringForAPI(model: string): string {
+  const configured = resolveProviderModel(model)
+  if (configured) {
+    // Cloud SDKs sign the remote model ID into their URL. Other adapters bind
+    // the qualified ID to a provider before translating at the fetch boundary.
+    switch (configured.profile.api) {
+      case 'bedrock':
+      case 'vertex':
+      case 'foundry':
+        return configured.model.id
+      case 'anthropic':
+      case 'openai-completions':
+      case 'openai-responses':
+      case 'codex':
+        return configured.qualifiedModel
+    }
+  }
   return model.replace(/\[(1|2)m\]/gi, '')
 }

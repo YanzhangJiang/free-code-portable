@@ -132,6 +132,7 @@ import {
   wrapFetchWithStepUpDetection,
 } from './auth.js'
 import { markClaudeAiMcpConnected } from './claudeai.js'
+import { assertClaudeAiMcpAllowed, isClaudeAiMcpAllowed } from './claudeaiAccess.js'
 import { getAllMcpConfigs, isMcpServerDisabled } from './config.js'
 import { getMcpServerHeaders } from './headersHelper.js'
 import { SdkControlClientTransport } from './SdkControlTransport.js'
@@ -372,7 +373,9 @@ function handleRemoteAuthFailure(
 export function createClaudeAiProxyFetch(innerFetch: FetchLike): FetchLike {
   return async (url, init) => {
     const doRequest = async () => {
+      assertClaudeAiMcpAllowed()
       await checkAndRefreshOAuthTokenIfNeeded()
+      assertClaudeAiMcpAllowed()
       const currentTokens = getClaudeAIOAuthTokens()
       if (!currentTokens) {
         throw new Error('No claude.ai OAuth token available')
@@ -399,7 +402,9 @@ export function createClaudeAiProxyFetch(innerFetch: FetchLike): FetchLike {
     // that — otherwise we double round-trip time for every connector whose
     // downstream service genuinely needs auth (the common case: 30+ servers
     // with "MCP server requires authentication but no OAuth token configured").
+    assertClaudeAiMcpAllowed()
     const tokenChanged = await handleOAuth401Error(sentToken).catch(() => false)
+    assertClaudeAiMcpAllowed()
     logEvent('tengu_mcp_claudeai_proxy_401', {
       tokenChanged:
         tokenChanged as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -414,6 +419,7 @@ export function createClaudeAiProxyFetch(innerFetch: FetchLike): FetchLike {
     try {
       return (await doRequest()).response
     } catch {
+      assertClaudeAiMcpAllowed()
       // Retry itself failed (network error). Return the original 401 so the
       // outer handler can classify it.
       return response
@@ -866,6 +872,7 @@ export const connectToServer = memoize(
       } else if (serverRef.type === 'sdk') {
         throw new Error('SDK servers should be handled in print.ts')
       } else if (serverRef.type === 'claudeai-proxy') {
+        assertClaudeAiMcpAllowed()
         logMCPDebug(
           name,
           `Initializing claude.ai proxy transport for server ${serverRef.id}`,
@@ -1690,6 +1697,7 @@ export async function clearServerCache(
 export async function ensureConnectedClient(
   client: ConnectedMCPServer,
 ): Promise<ConnectedMCPServer> {
+  if (client.config.type === 'claudeai-proxy') assertClaudeAiMcpAllowed()
   // SDK MCP servers run in-process and are handled separately via setupSdkMcpClients
   if (client.config.type === 'sdk') {
     return client
@@ -1775,6 +1783,9 @@ export const fetchToolsForClient = memoizeWithLRU(
             name: skipPrefix ? tool.name : fullyQualifiedName,
             mcpInfo: { serverName: client.name, toolName: tool.name },
             isMcp: true,
+            isEnabled() {
+              return client.config.type !== 'claudeai-proxy' || isClaudeAiMcpAllowed()
+            },
             // Collapse whitespace: _meta is open to external MCP servers, and
             // a newline here would inject orphan lines into the deferred-tool
             // list (formatDeferredToolLine joins on '\n').
@@ -1839,6 +1850,7 @@ export const fetchToolsForClient = memoizeWithLRU(
               parentMessage,
               onProgress?: ToolCallProgress<MCPProgress>,
             ) {
+              if (client.config.type === 'claudeai-proxy') assertClaudeAiMcpAllowed()
               const toolUseId = extractToolUseId(parentMessage)
               const meta = toolUseId
                 ? { 'claudecode/toolUseId': toolUseId }
@@ -2061,7 +2073,7 @@ export const fetchCommandsForClient = memoizeWithLRU(
           description: prompt.description ?? '',
           hasUserSpecifiedDescription: !!prompt.description,
           contentLength: 0, // Dynamic MCP content
-          isEnabled: () => true,
+          isEnabled: () => client.config.type !== 'claudeai-proxy' || isClaudeAiMcpAllowed(),
           isHidden: false,
           isMcp: true,
           progressMessage: 'running',
@@ -2145,6 +2157,9 @@ export async function reconnectMcpServerImpl(
   commands: Command[]
   resources?: ServerResource[]
 }> {
+  if (config.type === 'claudeai-proxy' && !isClaudeAiMcpAllowed()) {
+    return { client: { name, type: 'disabled', config }, tools: [], commands: [] }
+  }
   try {
     // Invalidate the keychain cache so we read fresh credentials from disk.
     // This is necessary when another process (e.g. the VS Code extension host)
@@ -2287,7 +2302,7 @@ export async function getMcpToolsCommandsAndResources(
   ]): Promise<void> => {
     try {
       // Check if server is disabled - if so, just add it to state without connecting
-      if (isMcpServerDisabled(name)) {
+      if (isMcpServerDisabled(name) || (config.type === 'claudeai-proxy' && !isClaudeAiMcpAllowed())) {
         onConnectionAttempt({
           client: {
             name,
@@ -3047,6 +3062,7 @@ async function callMCPTool({
   _meta?: Record<string, unknown>
   structuredContent?: Record<string, unknown>
 }> {
+  if (config.type === 'claudeai-proxy') assertClaudeAiMcpAllowed()
   const toolStartTime = Date.now()
   let progressInterval: NodeJS.Timeout | undefined
 

@@ -14,6 +14,46 @@ import { isInBundledMode } from '../bundledMode.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { getTeammateModeFromSnapshot } from './backends/teammateModeSnapshot.js'
 import { TEAMMATE_COMMAND_ENV_VAR } from './constants.js'
+import {
+  getExecutionProviderProfile,
+  getProviderConfigPath,
+  hasLoadedProviderConfiguration,
+  resolveProviderModel,
+} from '../../providers/runtime.js'
+import { getExternalServices } from '../../services/external/runtime.js'
+
+/** Shell-created panes cannot reliably inherit provider keys from this process. */
+export function requiresInProcessTeammates(model?: string): boolean {
+  const search = getExternalServices().configuration.webSearch
+  return resolveProviderModel(model)?.profile.apiKeyEnv !== undefined ||
+    (search !== undefined && 'apiKeyEnv' in search)
+}
+
+/** Reject before creating a pane or reporting a teammate as running. */
+export function assertPaneTeammateCredentials(model?: string): void {
+  if (requiresInProcessTeammates(model)) {
+    throw new Error(
+      'Model providers or search services configured with apiKeyEnv require --teammate-mode in-process. Tmux and iTerm2 teammates cannot safely inherit the parent process credentials.',
+    )
+  }
+}
+
+/** Provider startup arguments shared by every external teammate backend. */
+export function buildInheritedProviderCliFlags(model?: string): string[] {
+  const flags: string[] = []
+  if (hasLoadedProviderConfiguration()) {
+    flags.push(`--providers-file ${quote([getProviderConfigPath()])}`)
+    // Qualified --model selects its profile. Explicit legacy selection must also
+    // survive a config file that declares a different defaultProvider.
+    const provider = model ? resolveProviderModel(model)?.profile : getExecutionProviderProfile()
+    if (!provider) flags.push('--provider legacy')
+  }
+  const services = getExternalServices()
+  if (services.configurationLoaded) {
+    flags.push(`--services-file ${quote([services.configPath])}`)
+  }
+  return flags
+}
 
 /**
  * Gets the command to use for spawning teammate processes.
@@ -38,8 +78,10 @@ export function getTeammateCommand(): string {
 export function buildInheritedCliFlags(options?: {
   planModeRequired?: boolean
   permissionMode?: PermissionMode
+  model?: string
 }): string {
-  const flags: string[] = []
+  const modelOverride = options?.model ?? getMainLoopModelOverride()
+  const flags = buildInheritedProviderCliFlags(modelOverride ?? undefined)
   const { planModeRequired, permissionMode } = options || {}
 
   // Propagate permission mode to teammates, but NOT if plan mode is required
@@ -56,7 +98,6 @@ export function buildInheritedCliFlags(options?: {
   }
 
   // Propagate --model if explicitly set via CLI
-  const modelOverride = getMainLoopModelOverride()
   if (modelOverride) {
     flags.push(`--model ${quote([modelOverride])}`)
   }

@@ -2,7 +2,12 @@ import type {
   BetaContentBlock,
   BetaWebSearchTool20250305,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import { randomUUID } from 'node:crypto'
 import { getAPIProvider } from 'src/utils/model/providers.js'
+import { getActiveProviderProfile, resolveProviderModel } from '../../providers/runtime.js'
+import { getExternalServicesConfig, resolveExternalServiceCredentials } from '../../services/external/runtime.js'
+import { createWebSearchClient, normalizeSearchDomain } from '../../services/webSearch/client.js'
+import { getProxyFetchOptions } from '../../utils/proxy.js'
 import type { PermissionResult } from 'src/utils/permissions/PermissionResult.js'
 import { z } from 'zod/v4'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
@@ -24,7 +29,7 @@ import {
 
 const inputSchema = lazySchema(() =>
   z.strictObject({
-    query: z.string().min(2).describe('The search query to use'),
+    query: z.string().min(2).max(2000).describe('The search query to use'),
     allowed_domains: z
       .array(z.string())
       .optional()
@@ -33,6 +38,7 @@ const inputSchema = lazySchema(() =>
       .array(z.string())
       .optional()
       .describe('Never include search results from these domains'),
+    limit: z.number().int().min(1).max(20).optional().describe('Maximum number of results for a configured search service'),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -43,6 +49,7 @@ const searchResultSchema = lazySchema(() => {
   const searchHitSchema = z.object({
     title: z.string().describe('The title of the search result'),
     url: z.string().describe('The URL of the search result'),
+    snippet: z.string().optional().describe('An excerpt from the search result'),
   })
 
   return z.object({
@@ -155,7 +162,7 @@ export const WebSearchTool = buildTool({
   maxResultSizeChars: 100_000,
   shouldDefer: true,
   async description(input) {
-    return `Claude wants to search the web for: ${input.query}`
+    return `Search the web for: ${input.query}`
   },
   userFacingName() {
     return 'Web Search'
@@ -166,6 +173,8 @@ export const WebSearchTool = buildTool({
     return summary ? `Searching for ${summary}` : 'Searching the web'
   },
   isEnabled() {
+    if (getExternalServicesConfig().webSearch) return true
+    if (getActiveProviderProfile()) return false
     const provider = getAPIProvider()
     const model = getMainLoopModel()
 
@@ -249,11 +258,35 @@ export const WebSearchTool = buildTool({
         errorCode: 2,
       }
     }
+    try {
+      for (const domain of [...allowed_domains ?? [], ...blocked_domains ?? []]) normalizeSearchDomain(domain)
+    } catch (error) {
+      return { result: false, message: (error as Error).message, errorCode: 3 }
+    }
     return { result: true }
   },
   async call(input, context, _canUseTool, _parentMessage, onProgress) {
     const startTime = performance.now()
     const { query } = input
+    const searchConfiguration = getExternalServicesConfig().webSearch
+    if (searchConfiguration) {
+      const credentials = searchConfiguration.provider === 'brave'
+        ? resolveExternalServiceCredentials(searchConfiguration)
+        : {}
+      const networkOptions = getProxyFetchOptions()
+      const search = createWebSearchClient(searchConfiguration, {
+        apiKey: credentials.apiKey,
+        fetch: (url, init) => fetch(url, { ...init, ...networkOptions }),
+      })
+      const toolUseID = `portable-web-search-${randomUUID()}`
+      onProgress?.({ toolUseID, data: { type: 'query_update', query } })
+      const hits = await search.search({ query, allowedDomains: input.allowed_domains, blockedDomains: input.blocked_domains, limit: input.limit, signal: context.abortController.signal })
+      onProgress?.({ toolUseID, data: { type: 'search_results_received', query, resultCount: hits.length } })
+      return { data: { query, results: [{ tool_use_id: toolUseID, content: hits }], durationSeconds: (performance.now() - startTime) / 1000 } }
+    }
+    if (resolveProviderModel(context.options.mainLoopModel)) {
+      throw new Error('WebSearch requires a search service for this provider. Configure Brave Search or SearXNG in services.json.')
+    }
     const userMessage = createUserMessage({
       content: 'Perform a web search for the query: ' + query,
     })

@@ -64,6 +64,8 @@ import type { SystemPrompt } from './systemPromptType.js'
 import { getToolSchemaCache } from './toolSchemaCache.js'
 import { windowsPathToPosixPath } from './windowsPaths.js'
 import { zodToJsonSchema } from './zodToJsonSchema.js'
+import { resolveProviderModel } from '../providers/runtime.js'
+import { getProviderExecutionContext } from '../providers/execution-context.js'
 
 // Extended BetaTool type with strict mode and defer_loading support
 type BetaToolWithExtras = BetaTool & {
@@ -133,11 +135,10 @@ export async function toolToAPISchema(
     }
   },
 ): Promise<BetaToolUnion> {
-  // Session-stable base schema: name, description, input_schema, strict,
-  // eager_input_streaming. These are computed once per session and cached to
-  // prevent mid-session GrowthBook flips (tengu_tool_pear, tengu_fgts) or
-  // tool.prompt() drift from churning the serialized tool array bytes.
-  // See toolSchemaCache.ts for rationale.
+  // Keep legacy schema bytes stable within a model/provider namespace.
+  // Configured profiles deliberately render afresh: concurrent agents may have
+  // different tool registries, permissions, or ToolSearch protocol prompts even
+  // when they use the same model. A profile/model-only cache cannot encode that.
   //
   // Cache key includes inputJSONSchema when present. StructuredOutput instances
   // share the name 'StructuredOutput' but carry different schemas per workflow
@@ -148,8 +149,12 @@ export async function toolToAPISchema(
     'inputJSONSchema' in tool && tool.inputJSONSchema
       ? `${tool.name}:${jsonStringify(tool.inputJSONSchema)}`
       : tool.name
-  const cache = getToolSchemaCache()
-  let base = cache.get(cacheKey)
+  const execution = getProviderExecutionContext()
+  const model = options.model ?? (execution?.kind === 'profile' ? execution.resolved.qualifiedModel : execution?.model)
+  const configuredModel = resolveProviderModel(model)
+  const cache = configuredModel ? undefined
+    : getToolSchemaCache(JSON.stringify([getAPIProvider(model), model ?? null]))
+  let base = cache?.get(cacheKey)
   if (!base) {
     const strictToolsEnabled =
       checkStatsigFeatureGate_CACHED_MAY_BE_STALE('tengu_tool_pear')
@@ -185,8 +190,8 @@ export async function toolToAPISchema(
     if (
       strictToolsEnabled &&
       tool.strict === true &&
-      options.model &&
-      modelSupportsStructuredOutputs(options.model)
+      model &&
+      modelSupportsStructuredOutputs(model)
     ) {
       base.strict = true
     }
@@ -197,7 +202,8 @@ export async function toolToAPISchema(
     // Gated to direct api.anthropic.com: proxies (LiteLLM etc.) and Bedrock/Vertex
     // with Claude 4.5 reject this field with 400. See GH#32742, PR #21729.
     if (
-      getAPIProvider() === 'firstParty' &&
+      !configuredModel &&
+      getAPIProvider(model) === 'firstParty' &&
       isFirstPartyAnthropicBaseUrl() &&
       (getFeatureValue_CACHED_MAY_BE_STALE('tengu_fgts', false) ||
         isEnvTruthy(process.env.CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING))
@@ -205,7 +211,7 @@ export async function toolToAPISchema(
       base.eager_input_streaming = true
     }
 
-    cache.set(cacheKey, base)
+    cache?.set(cacheKey, base)
   }
 
   // Per-request overlay: defer_loading and cache_control vary by call

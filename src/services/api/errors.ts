@@ -7,6 +7,8 @@ import type {
   BetaMessage,
   BetaStopReason,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
+import { classifyProviderError, parseProviderContextOverflow, redactProviderErrorMessage } from '../../providers/errors.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
 import { AFK_MODE_BETA_HEADER } from 'src/constants/betas.js'
 import type { SDKAssistantMessageError } from 'src/entrypoints/agentSdkTypes.js'
 import type {
@@ -86,13 +88,8 @@ export function parsePromptTooLongTokenCounts(rawMessage: string): {
   actualTokens: number | undefined
   limitTokens: number | undefined
 } {
-  const match = rawMessage.match(
-    /prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)/i,
-  )
-  return {
-    actualTokens: match ? parseInt(match[1]!, 10) : undefined,
-    limitTokens: match ? parseInt(match[2]!, 10) : undefined,
-  }
+  const counts = parseProviderContextOverflow(rawMessage)
+  return { actualTokens: counts?.actualTokens, limitTokens: counts?.limitTokens }
 }
 
 /**
@@ -430,6 +427,43 @@ export function getAssistantMessageFromError(
     messagesForAPI?: (UserMessage | AssistantMessage)[]
   },
 ): AssistantMessage {
+  const failure = classifyProviderError(error)
+  const profile = resolveProviderModel(model)?.profile
+  if (failure.kind === 'context_overflow') {
+    // Reactive compact consumes this stable UI marker and the provider's token
+    // counts. Never invent counts for a code-only or byte-size rejection.
+    return createAssistantAPIErrorMessage({
+      content: PROMPT_TOO_LONG_ERROR_MESSAGE,
+      error: 'invalid_request',
+      errorDetails: failure.message,
+    })
+  }
+  if (profile) {
+    switch (failure.kind) {
+      case 'authentication':
+      case 'permission':
+        return createAssistantAPIErrorMessage({
+          content: `${API_ERROR_MESSAGE_PREFIX}: Provider "${profile.id}" rejected authentication or access. Check ${profile.apiKeyEnv ?? 'this provider’s credentials'} and model access. ${failure.message}`,
+          error: 'authentication_failed',
+        })
+      case 'quota_exceeded':
+        return createAssistantAPIErrorMessage({ content: `${API_ERROR_MESSAGE_PREFIX}: Provider quota exhausted. Check billing or switch /provider. ${failure.message}`, error: 'billing_error' })
+      case 'rate_limit':
+        return createAssistantAPIErrorMessage({ content: `${API_ERROR_MESSAGE_PREFIX}: Provider rate limit reached. ${failure.message}`, error: 'rate_limit' })
+      case 'unsupported':
+      case 'output_limit':
+      case 'invalid_request':
+        return createAssistantAPIErrorMessage({ content: `${API_ERROR_MESSAGE_PREFIX}: ${failure.message}`, error: 'invalid_request' })
+      case 'server':
+        return createAssistantAPIErrorMessage({ content: `${API_ERROR_MESSAGE_PREFIX}: ${failure.message}`, error: 'server_error' })
+      case 'timeout':
+        return createAssistantAPIErrorMessage({ content: API_TIMEOUT_ERROR_MESSAGE, error: 'unknown' })
+      case 'connection':
+      case 'unknown':
+      case 'cancelled':
+        return createAssistantAPIErrorMessage({ content: `${API_ERROR_MESSAGE_PREFIX}: ${failure.message}`, error: 'unknown' })
+    }
+  }
   // Check for SDK timeout errors
   if (
     error instanceof APIConnectionTimeoutError ||
@@ -557,22 +591,6 @@ export function getAssistantMessageFromError(
     })
   }
 
-  // Handle prompt too long errors (Vertex returns 413, direct API returns 400)
-  // Use case-insensitive check since Vertex returns "Prompt is too long" (capitalized)
-  if (
-    error instanceof Error &&
-    error.message.toLowerCase().includes('prompt is too long')
-  ) {
-    // Content stays generic (UI matches on exact string). The raw error with
-    // token counts goes into errorDetails — reactive compact's retry loop
-    // parses the gap from there via getPromptTooLongTokenGap.
-    return createAssistantAPIErrorMessage({
-      content: PROMPT_TOO_LONG_ERROR_MESSAGE,
-      error: 'invalid_request',
-      errorDetails: error.message,
-    })
-  }
-
   // Check for PDF page limit errors
   if (
     error instanceof Error &&
@@ -581,7 +599,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: getPdfTooLargeErrorMessage(),
       error: 'invalid_request',
-      errorDetails: error.message,
+      errorDetails: redactProviderErrorMessage(error.message),
     })
   }
 
@@ -618,7 +636,7 @@ export function getAssistantMessageFromError(
   ) {
     return createAssistantAPIErrorMessage({
       content: getImageTooLargeErrorMessage(),
-      errorDetails: error.message,
+      errorDetails: redactProviderErrorMessage(error.message),
     })
   }
 
@@ -634,7 +652,7 @@ export function getAssistantMessageFromError(
         ? 'An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images.'
         : 'An image in the conversation exceeds the dimension limit for many-image requests (2000px). Run /compact to remove old images from context, or start a new session.',
       error: 'invalid_request',
-      errorDetails: error.message,
+      errorDetails: redactProviderErrorMessage(error.message),
     })
   }
 
@@ -728,7 +746,7 @@ export function getAssistantMessageFromError(
     return createAssistantAPIErrorMessage({
       content: `API Error: 400 duplicate tool_use ID in conversation history.${rewindInstruction}`,
       error: 'invalid_request',
-      errorDetails: error.message,
+      errorDetails: redactProviderErrorMessage(error.message),
     })
   }
 
@@ -923,7 +941,7 @@ export function getAssistantMessageFromError(
 
   if (error instanceof Error) {
     return createAssistantAPIErrorMessage({
-      content: `${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+      content: `${API_ERROR_MESSAGE_PREFIX}: ${redactProviderErrorMessage(error.message)}`,
       error: 'unknown',
     })
   }
@@ -963,6 +981,14 @@ function get3PModelFallbackSuggestion(model: string): string | undefined {
  * Returns a standardized error type string suitable for Datadog tagging.
  */
 export function classifyAPIError(error: unknown): string {
+  const failure = classifyProviderError(error)
+  if (failure.kind === 'cancelled') return 'aborted'
+  if (failure.kind === 'context_overflow') return 'prompt_too_long'
+  if (failure.kind === 'output_limit') return 'output_token_limit'
+  if (failure.kind === 'unsupported') return 'unsupported_capability'
+  if (failure.kind === 'rate_limit') return 'rate_limit'
+  if (failure.kind === 'quota_exceeded') return 'credit_balance_low'
+  if (failure.kind === 'timeout') return 'api_timeout'
   // Aborted requests
   if (error instanceof Error && error.message === 'Request was aborted.') {
     return 'aborted'
@@ -1157,12 +1183,22 @@ export function classifyAPIError(error: unknown): string {
     return 'connection_error'
   }
 
+  if (failure.kind === 'authentication' || failure.kind === 'permission') return 'auth_error'
+  if (failure.kind === 'server') return 'server_error'
+  if (failure.kind === 'invalid_request') return 'client_error'
+  if (failure.kind === 'connection') return 'connection_error'
+
   return 'unknown'
 }
 
 export function categorizeRetryableAPIError(
   error: APIError,
 ): SDKAssistantMessageError {
+  const failure = classifyProviderError(error)
+  if (failure.kind === 'rate_limit') return 'rate_limit'
+  if (failure.kind === 'authentication' || failure.kind === 'permission') return 'authentication_failed'
+  if (failure.kind === 'context_overflow' || failure.kind === 'output_limit' || failure.kind === 'unsupported' || failure.kind === 'invalid_request') return 'invalid_request'
+  if (failure.kind === 'quota_exceeded') return 'billing_error'
   if (
     error.status === 529 ||
     error.message?.includes('"type":"overloaded_error"')
@@ -1190,6 +1226,13 @@ export function getErrorMessageIfRefusal(
   }
 
   logEvent('tengu_refusal_api_response', {})
+
+  if (resolveProviderModel(model)) {
+    return createAssistantAPIErrorMessage({
+      content: `${API_ERROR_MESSAGE_PREFIX}: The selected model declined this request. Try rephrasing it or choose another configured model with /model.`,
+      error: 'invalid_request',
+    })
+  }
 
   const baseMessage = getIsNonInteractiveSession()
     ? `${API_ERROR_MESSAGE_PREFIX}: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach.`

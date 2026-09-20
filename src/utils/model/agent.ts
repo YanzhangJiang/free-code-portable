@@ -1,6 +1,6 @@
 import type { PermissionMode } from '../permissions/PermissionMode.js'
 import { capitalize } from '../stringUtils.js'
-import { MODEL_ALIASES, type ModelAlias } from './aliases.js'
+import { MODEL_ALIASES } from './aliases.js'
 import { applyBedrockRegionPrefix, getBedrockRegionPrefix } from './bedrock.js'
 import {
   getCanonicalName,
@@ -8,12 +8,23 @@ import {
   parseUserSpecifiedModel,
 } from './model.js'
 import { getAPIProvider } from './providers.js'
+import {
+  getExecutionProviderProfile,
+  resolveModelInProviderProfile,
+  getProviderProfiles,
+  getQualifiedModelId,
+  resolveExplicitProviderModel,
+  resolveProviderCredentials,
+  resolveProviderModel,
+} from '../../providers/runtime.js'
+
+import { isModelAllowed } from './modelAllowlist.js'
 
 export const AGENT_MODEL_OPTIONS = [...MODEL_ALIASES, 'inherit'] as const
 export type AgentModelAlias = (typeof AGENT_MODEL_OPTIONS)[number]
 
 export type AgentModelOption = {
-  value: AgentModelAlias
+  value: string
   label: string
   description: string
 }
@@ -37,9 +48,23 @@ export function getDefaultSubagentModel(): string {
 export function getAgentModel(
   agentModel: string | undefined,
   parentModel: string,
-  toolSpecifiedModel?: ModelAlias,
+  toolSpecifiedModel?: string,
   permissionMode?: PermissionMode,
 ): string {
+  const parent = resolveProviderModel(parentModel)
+  const environmentModel = process.env.CLAUDE_CODE_SUBAGENT_MODEL || undefined
+  const requested = environmentModel ?? toolSpecifiedModel ?? agentModel ?? 'inherit'
+  const configured = requested === 'inherit'
+    ? parent
+    : resolveExplicitProviderModel(requested) ??
+      (parent ? resolveModelInProviderProfile(parent.profile, requested) : undefined)
+  if (configured) {
+    if (!isModelAllowed(configured.qualifiedModel)) {
+      throw new Error(`Model '${configured.qualifiedModel}' is not available. Your organization restricts model selection.`)
+    }
+    resolveProviderCredentials(configured.profile)
+    return configured.qualifiedModel
+  }
   if (process.env.CLAUDE_CODE_SUBAGENT_MODEL) {
     return parseUserSpecifiedModel(process.env.CLAUDE_CODE_SUBAGENT_MODEL)
   }
@@ -132,7 +157,19 @@ export function getAgentModelDisplay(model: string | undefined): string {
  * Get available model options for agents
  */
 export function getAgentModelOptions(): AgentModelOption[] {
+  const configured = getProviderProfiles().flatMap(profile => profile.models.map(model => ({
+    value: getQualifiedModelId(profile.id, model.id),
+    label: `${profile.name ?? profile.id} / ${model.name ?? model.id}`,
+    description: `${profile.api} · ${model.contextWindow.toLocaleString()} token context`,
+  }))).filter(option => isModelAllowed(option.value))
+  const inherit = {
+    value: 'inherit',
+    label: 'Inherit from parent',
+    description: 'Use the same model as the main conversation',
+  }
+  if (getExecutionProviderProfile()) return [...configured, inherit]
   return [
+    ...configured,
     {
       value: 'sonnet',
       label: 'Sonnet',
@@ -148,10 +185,6 @@ export function getAgentModelOptions(): AgentModelOption[] {
       label: 'Haiku',
       description: 'Fast and efficient for simple tasks',
     },
-    {
-      value: 'inherit',
-      label: 'Inherit from parent',
-      description: 'Use the same model as the main conversation',
-    },
+    inherit,
   ]
 }

@@ -6,7 +6,12 @@ import { lazySchema } from '../../utils/lazySchema.js'
 import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
 import { getRuleByContentsForTool } from '../../utils/permissions/permissions.js'
 import { isPreapprovedHost } from './preapproved.js'
-import { DESCRIPTION, WEB_FETCH_TOOL_NAME } from './prompt.js'
+import { DESCRIPTION, DIRECT_DESCRIPTION, WEB_FETCH_TOOL_NAME } from './prompt.js'
+import { getExternalServices } from '../../services/external/runtime.js'
+import { resolveProviderModel } from '../../providers/runtime.js'
+import { getCACertificates } from '../../utils/caCerts.js'
+import { getProxyUrl, shouldBypassProxy } from '../../utils/proxy.js'
+import { createDirectWebDependencies, fetchDirectWebContent, formatDirectWebContent } from './direct.js'
 import {
   getToolUseSummary,
   renderToolResultMessage,
@@ -47,6 +52,11 @@ type OutputSchema = ReturnType<typeof outputSchema>
 
 export type Output = z.infer<OutputSchema>
 
+function useDirectWebFetch(model?: string): boolean {
+  const mode = getExternalServices().configuration.webFetch?.mode
+  return mode ? mode === 'direct' : !!resolveProviderModel(model)
+}
+
 function webFetchToolInputToPermissionRuleContent(input: {
   [k: string]: unknown
 }): string {
@@ -73,9 +83,9 @@ export const WebFetchTool = buildTool({
     const { url } = input as { url: string }
     try {
       const hostname = new URL(url).hostname
-      return `Claude wants to fetch content from ${hostname}`
+      return `The agent wants to fetch content from ${hostname}`
     } catch {
-      return `Claude wants to fetch content from this URL`
+      return `The agent wants to fetch content from this URL`
     }
   },
   userFacingName() {
@@ -186,7 +196,7 @@ export const WebFetchTool = buildTool({
     // MCP tool count thresholds), invalidating the Anthropic API prompt
     // cache on each toggle — two consecutive cache misses per flicker event.
     return `IMPORTANT: WebFetch WILL FAIL for authenticated or private URLs. Before using this tool, check if the URL points to an authenticated service (e.g. Google Docs, Confluence, Jira, GitHub). If so, look for a specialized MCP tool that provides authenticated access.
-${DESCRIPTION}`
+${useDirectWebFetch() ? DIRECT_DESCRIPTION : DESCRIPTION}`
   },
   async validateInput(input) {
     const { url } = input
@@ -207,11 +217,20 @@ ${DESCRIPTION}`
   renderToolResultMessage,
   async call(
     { url, prompt },
-    { abortController, options: { isNonInteractiveSession } },
+    { abortController, options: { isNonInteractiveSession, mainLoopModel } },
   ) {
     const start = Date.now()
 
-    const response = await getURLMarkdownContent(url, abortController)
+    const direct = useDirectWebFetch(mainLoopModel)
+    const profileModel = direct ? resolveProviderModel(mainLoopModel)?.model : undefined
+    const response = direct
+      ? await fetchDirectWebContent(url, abortController.signal, createDirectWebDependencies({
+          ca: getCACertificates(),
+          proxyForURL: candidate => shouldBypassProxy(candidate) ? undefined : getProxyUrl(),
+        }), {
+          maxCharacters: Math.min(20_000, Math.floor((profileModel?.contextWindow ?? 40_000) / 2)),
+        })
+      : await getURLMarkdownContent(url, abortController)
 
     // Check if we got a redirect to a different host
     if ('type' in response && response.type === 'redirect') {
@@ -261,7 +280,9 @@ To complete your request, I need to fetch content from the redirected URL. Pleas
     const isPreapproved = isPreapprovedUrl(url)
 
     let result: string
-    if (
+    if (direct) {
+      result = formatDirectWebContent(content, url, prompt)
+    } else if (
       isPreapproved &&
       contentType.includes('text/markdown') &&
       content.length < MAX_MARKDOWN_LENGTH

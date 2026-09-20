@@ -8,6 +8,8 @@ import type { AgentDefinition } from '../tools/AgentTool/loadAgentsDir.js'
 import { isBuiltInAgent } from '../tools/AgentTool/loadAgentsDir.js'
 import { isEnvTruthy } from './envUtils.js'
 import { asSystemPrompt, type SystemPrompt } from './systemPromptType.js'
+import { resolveProviderModel } from '../providers/runtime.js'
+import { createProviderPromptPolicy } from '../providers/prompt-policy.js'
 
 export { asSystemPrompt, type SystemPrompt } from './systemPromptType.js'
 
@@ -68,19 +70,57 @@ export function buildEffectiveSystemPrompt({
     const { getCoordinatorSystemPrompt } =
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('../coordinator/coordinatorMode.js') as typeof import('../coordinator/coordinatorMode.js')
+    const resolvedModel = resolveProviderModel(
+      toolUseContext.options.mainLoopModel,
+    )
+    const policy = resolvedModel
+      ? createProviderPromptPolicy(
+          resolvedModel.qualifiedModel,
+          resolvedModel.model,
+          new Set(toolUseContext.options.tools.map(tool => tool.name)),
+        )
+      : undefined
     return asSystemPrompt([
+      ...(policy ? [policy.identity] : []),
       getCoordinatorSystemPrompt(),
+      ...(policy ? [policy.modelDescription, policy.toolInstructions] : []),
       ...(appendSystemPrompt ? [appendSystemPrompt] : []),
     ])
   }
 
-  const agentSystemPrompt = mainThreadAgentDefinition
+  let agentSystemPrompt = mainThreadAgentDefinition
     ? isBuiltInAgent(mainThreadAgentDefinition)
       ? mainThreadAgentDefinition.getSystemPrompt({
           toolUseContext: { options: toolUseContext.options },
         })
       : mainThreadAgentDefinition.getSystemPrompt()
     : undefined
+
+  // Built-in specialists replace the default prompt, so they need their own
+  // request-bound identity and capability description. User-supplied prompt
+  // replacements remain opaque and retain their existing override semantics.
+  if (
+    agentSystemPrompt &&
+    mainThreadAgentDefinition &&
+    isBuiltInAgent(mainThreadAgentDefinition)
+  ) {
+    const resolvedModel = resolveProviderModel(
+      toolUseContext.options.mainLoopModel,
+    )
+    if (resolvedModel) {
+      const policy = createProviderPromptPolicy(
+        resolvedModel.qualifiedModel,
+        resolvedModel.model,
+        new Set(toolUseContext.options.tools.map(tool => tool.name)),
+      )
+      agentSystemPrompt = [
+        policy.identity,
+        agentSystemPrompt,
+        policy.modelDescription,
+        policy.toolInstructions,
+      ].join('\n\n')
+    }
+  }
 
   // Log agent memory loaded event for main loop agents
   if (mainThreadAgentDefinition?.memory) {

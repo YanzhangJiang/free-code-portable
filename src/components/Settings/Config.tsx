@@ -19,7 +19,11 @@ import { isBridgeEnabled } from '../../bridge/bridgeEnabled.js';
 import { ThemePicker } from '../ThemePicker.js';
 import { useAppState, useSetAppState, useAppStateStore } from '../../state/AppState.js';
 import { ModelPicker } from '../ModelPicker.js';
+import { selectSessionModel, selectSessionProvider } from '../../commands/provider/selection.js';
+import { getActiveProviderProfile, getProviderProfiles, resolveProviderModel } from '../../providers/runtime.js';
 import { modelDisplayString, isOpus1mMergeEnabled } from '../../utils/model/model.js';
+import { isModelAllowed } from '../../utils/model/modelAllowlist.js';
+import type { EffortLevel } from '../../utils/effort.js';
 import { isBilledAsExtraUsage } from '../../utils/extraUsage.js';
 import { ClaudeMdExternalIncludesDialog } from '../ClaudeMdExternalIncludesDialog.js';
 import { ChannelDowngradeDialog, type ChannelDowngradeChoice } from '../ChannelDowngradeDialog.js';
@@ -36,14 +40,14 @@ import { useIsInsideModal } from '../../context/modalContext.js';
 import { SearchBox } from '../SearchBox.js';
 import { isSupportedTerminal, hasAccessToIDEExtensionDiffFeature } from '../../utils/ide.js';
 import { getInitialSettings, getSettingsForSource, updateSettingsForSource } from '../../utils/settings/settings.js';
-import { getUserMsgOptIn, setUserMsgOptIn } from '../../bootstrap/state.js';
+import { getUserMsgOptIn, setUserMsgOptIn, setMainLoopModelOverride } from '../../bootstrap/state.js';
 import { DEFAULT_OUTPUT_STYLE_NAME } from 'src/constants/outputStyles.js';
 import { isEnvTruthy, isRunningOnHomespace } from 'src/utils/envUtils.js';
 import type { LocalJSXCommandContext, CommandResultDisplay } from '../../commands.js';
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js';
 import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js';
 import { getCliTeammateModeOverride, clearCliTeammateModeOverride } from '../../utils/swarm/backends/teammateModeSnapshot.js';
-import { getHardcodedTeammateModelFallback } from '../../utils/swarm/teammateModel.js';
+import { getHardcodedTeammateModelFallback, resolveTeammateModelSelection } from '../../utils/swarm/teammateModel.js';
 import { useSearchInput } from '../../hooks/useSearchInput.js';
 import { useTerminalSize } from '../../hooks/useTerminalSize.js';
 import { clearFastModeCooldown, FAST_MODE_MODEL_DISPLAY, isFastModeAvailable, isFastModeEnabled, getFastModeModel, isFastModeSupportedByModel } from '../../utils/fastMode.js';
@@ -82,6 +86,7 @@ type Setting = (SettingBase & {
   type: 'managedEnum';
 });
 type SubMenu = 'Theme' | 'Model' | 'TeammateModel' | 'ExternalIncludes' | 'OutputStyle' | 'ChannelDowngrade' | 'Language' | 'EnableAutoUpdates';
+
 export function Config({
   onClose,
   context,
@@ -149,14 +154,17 @@ export function Config({
   const initialThemeSetting = React.useRef(themeSetting);
   // AppState fields Config may modify — snapshot once at mount.
   const store = useAppStateStore();
+  const [initialProviderId] = useState(() => getActiveProviderProfile()?.id);
   const [initialAppState] = useState(() => {
     const s_4 = store.getState();
     return {
+      providerModel: resolveProviderModel(s_4.mainLoopModel)?.qualifiedModel,
       mainLoopModel: s_4.mainLoopModel,
       mainLoopModelForSession: s_4.mainLoopModelForSession,
       verbose: s_4.verbose,
       thinkingEnabled: s_4.thinkingEnabled,
       fastMode: s_4.fastMode,
+      effortValue: s_4.effortValue,
       promptSuggestionEnabled: s_4.promptSuggestionEnabled,
       isBriefOnly: s_4.isBriefOnly,
       replBridgeEnabled: s_4.replBridgeEnabled,
@@ -175,6 +183,7 @@ export function Config({
   const isDirty = React.useRef(false);
   const [showThinkingWarning, setShowThinkingWarning] = useState(false);
   const [showSubmenu, setShowSubmenu] = useState<SubMenu | null>(null);
+  const [modelSelectionError, setModelSelectionError] = useState<string>();
   const {
     query: searchQuery,
     setQuery: setSearchQuery,
@@ -200,7 +209,17 @@ export function Config({
   const memoryFiles = React.use(getMemoryFiles(true));
   const shouldShowExternalIncludesToggle = hasExternalClaudeMdIncludes(memoryFiles);
   const autoUpdaterDisabledReason = getAutoUpdaterDisabledReason();
-  function onChangeMainModelConfig(value: string | null): void {
+  function onChangeMainModelConfig(value: string | null, effort?: EffortLevel): boolean {
+    try {
+      if (value && !isModelAllowed(value)) {
+        throw new Error(`Model '${value}' is not available. Your organization restricts model selection.`);
+      }
+      value = selectSessionModel(value, store.getState().tasks);
+    } catch (error) {
+      setModelSelectionError(error instanceof Error ? error.message : String(error));
+      return false;
+    }
+    setModelSelectionError(undefined);
     const previousModel = mainLoopModel;
     logEvent('tengu_config_model_changed', {
       from_model: previousModel as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -209,7 +228,9 @@ export function Config({
     setAppState(prev => ({
       ...prev,
       mainLoopModel: value,
-      mainLoopModelForSession: null
+      mainLoopModelForSession: null,
+      ...(getActiveProviderProfile() ? { fastMode: false } : {}),
+      ...(getProviderProfiles().length > 0 && effort !== undefined ? { effortValue: effort } : {})
     }));
     setChanges(prev_0 => {
       const valStr = modelDisplayString(value) + (isBilledAsExtraUsage(value, false, isOpus1mMergeEnabled()) ? ' · Billed as extra usage' : '');
@@ -228,6 +249,7 @@ export function Config({
         model: valStr
       };
     });
+    return true;
   }
   function onChangeVerbose(value_0: boolean): void {
     // Update the global config to persist the setting
@@ -1177,6 +1199,16 @@ export function Config({
   // applied to disk/AppState immediately on toggle, so "cancel" means
   // actively writing the old values back.
   const revertChanges = useCallback(() => {
+    // Model rollback includes the provider registry: helper requests consult it
+    // independently of AppState. Validate the switch before touching other state.
+    if (getActiveProviderProfile()?.id !== initialProviderId) {
+      if (initialAppState.providerModel !== undefined) {
+        selectSessionModel(initialAppState.providerModel, store.getState().tasks);
+      } else {
+        selectSessionProvider(undefined, store.getState().tasks);
+      }
+    }
+    setMainLoopModelOverride(initialAppState.mainLoopModel);
     // Theme: restores ThemeProvider React state. Must run before the global
     // config overwrite since setTheme internally calls saveGlobalConfig with
     // a partial update — we want the full snapshot to be the last write.
@@ -1232,6 +1264,7 @@ export function Config({
       verbose: ia.verbose,
       thinkingEnabled: ia.thinkingEnabled,
       fastMode: ia.fastMode,
+      effortValue: ia.effortValue,
       promptSuggestionEnabled: ia.promptSuggestionEnabled,
       isBriefOnly: ia.isBriefOnly,
       replBridgeEnabled: ia.replBridgeEnabled,
@@ -1247,7 +1280,7 @@ export function Config({
     if (getUserMsgOptIn() !== initialUserMsgOptIn) {
       setUserMsgOptIn(initialUserMsgOptIn);
     }
-  }, [themeSetting, setTheme, initialLocalSettings, initialUserSettings, initialAppState, initialUserMsgOptIn, setAppState]);
+  }, [themeSetting, setTheme, initialLocalSettings, initialUserSettings, initialAppState, initialUserMsgOptIn, setAppState, initialProviderId, store]);
 
   // Escape: revert all changes (if any) and close.
   const handleEscape = useCallback(() => {
@@ -1255,7 +1288,12 @@ export function Config({
       return;
     }
     if (isDirty.current) {
-      revertChanges();
+      try {
+        revertChanges();
+      } catch (error) {
+        setModelSelectionError(error instanceof Error ? error.message : String(error));
+        return;
+      }
     }
     onClose('Config dialog dismissed', {
       display: 'system'
@@ -1447,6 +1485,7 @@ export function Config({
     }
   }, [showSubmenu, headerFocused, isSearchMode, searchQuery, setSearchQuery, toggleSetting]);
   return <Box flexDirection="column" width="100%" tabIndex={0} autoFocus onKeyDown={handleKeyDown}>
+      {modelSelectionError && <Text color="error">{modelSelectionError}</Text>}
       {showSubmenu === 'Theme' ? <>
           <ThemePicker onThemeSelect={setting_1 => {
         isDirty.current = true;
@@ -1467,9 +1506,9 @@ export function Config({
             </Text>
           </Box>
         </> : showSubmenu === 'Model' ? <>
-          <ModelPicker initial={mainLoopModel} onSelect={(model_0, _effort) => {
+          <ModelPicker initial={mainLoopModel} skipSettingsWrite={getProviderProfiles().length > 0} onSelect={(model_0, effort) => {
+        if (!onChangeMainModelConfig(model_0, effort)) return;
         isDirty.current = true;
-        onChangeMainModelConfig(model_0);
         setShowSubmenu(null);
         setTabsHidden(false);
       }} onCancel={() => {
@@ -1483,7 +1522,14 @@ export function Config({
             </Byline>
           </Text>
         </> : showSubmenu === 'TeammateModel' ? <>
-          <ModelPicker initial={globalConfig.teammateDefaultModel ?? null} skipSettingsWrite headerText="Default model for newly spawned teammates. The leader can override via the tool call's model parameter." onSelect={(model_1, _effort_0) => {
+          <ModelPicker initial={globalConfig.teammateDefaultModel ?? null} skipSettingsWrite headerText="Default model for newly spawned teammates. Choose any configured provider, or follow the leader's model. The leader can override this in the tool call." onSelect={(model_1, _effort_0) => {
+        try {
+          if (model_1 !== null) resolveTeammateModelSelection(model_1, mainLoopModel, undefined);
+        } catch (error) {
+          setModelSelectionError(error instanceof Error ? error.message : String(error));
+          return;
+        }
+        setModelSelectionError(undefined);
         setShowSubmenu(null);
         setTabsHidden(false);
         // First-open-then-Enter from unset: picker highlights "Default"
@@ -1740,7 +1786,11 @@ function teammateModelDisplayString(value: string | null | undefined): string {
     return modelDisplayString(getHardcodedTeammateModelFallback());
   }
   if (value === null) return "Default (leader's model)";
-  return modelDisplayString(value);
+  try {
+    return modelDisplayString(value);
+  } catch {
+    return `${value} (unavailable)`;
+  }
 }
 const THEME_LABELS: Record<string, string> = {
   auto: 'Auto (match terminal)',
